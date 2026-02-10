@@ -6,7 +6,7 @@ PT 魔力计算器插件：展示主程序中是否有 PT 魔力计算所需的�
 import math
 import re
 from datetime import datetime
-from typing import Any, List, Dict, Optional
+from typing import Any, List, Dict, Optional, Tuple
 
 from fastapi import Query, Body
 from app.chain.site import SiteChain
@@ -103,6 +103,20 @@ def _get_parser_parse_info(schema_value: str) -> Dict[str, Any]:
         return {"error": str(e)}
 
 
+def _parse_list_config(value: Any) -> List[str]:
+    """配置项解析：支持 list 或逗号分隔字符串，返回非空字符串列表。"""
+    if isinstance(value, list):
+        return [str(x).strip() for x in value if x]
+    if isinstance(value, str):
+        return [x.strip() for x in value.split(",") if x.strip()]
+    return []
+
+
+def _torrent_key(torrent_id: Any, name: str = "", size: Any = 0) -> str:
+    """从 torrent_id / name / size 得到唯一键，用于映射。"""
+    return str(torrent_id) if torrent_id else f"{name or ''}|{size or 0}"
+
+
 class PTBonusCalc(_PluginBase):
     plugin_name = "PT魔力计算器"
     plugin_desc = "展示主程序中是否有 PT 魔力计算所需的信息：用户做种信息、站点适配信息、parser 解析网页信息。"
@@ -124,24 +138,9 @@ class PTBonusCalc(_PluginBase):
         try:
             self.site_oper = SiteOper()
             self.sites_helper = SitesHelper()
-            # 读取同步数据下载器配置（支持数组或逗号分隔字符串）
-            sync_downloaders_value = config.get("sync_downloaders")
-            if isinstance(sync_downloaders_value, list):
-                self.sync_downloaders = [str(d).strip() for d in sync_downloaders_value if d]
-            elif isinstance(sync_downloaders_value, str):
-                self.sync_downloaders = [d.strip() for d in sync_downloaders_value.split(",") if d.strip()]
-            else:
-                self.sync_downloaders = []
+            self.sync_downloaders = _parse_list_config(config.get("sync_downloaders"))
             logger.info(f"PT魔力计算器插件初始化：同步数据下载器配置 = {self.sync_downloaders}")
-            
-            # 读取站点选择配置（支持数组或逗号分隔字符串）
-            selected_sites_value = config.get("selected_sites")
-            if isinstance(selected_sites_value, list):
-                self.selected_sites = [str(s).strip() for s in selected_sites_value if s]
-            elif isinstance(selected_sites_value, str):
-                self.selected_sites = [s.strip() for s in selected_sites_value.split(",") if s.strip()]
-            else:
-                self.selected_sites = []
+            self.selected_sites = _parse_list_config(config.get("selected_sites"))
             logger.info(f"PT魔力计算器插件初始化：站点选择配置 = {self.selected_sites}")
             
             # 处理表单中的站点地址映射配置（site_address_mapping_* 字段）
@@ -149,8 +148,7 @@ class PTBonusCalc(_PluginBase):
             for key, value in config.items():
                 if key.startswith("site_address_mapping_") and value:
                     site_domain = key.replace("site_address_mapping_", "")
-                    # 解析逗号分隔的关键词
-                    keywords = [k.strip() for k in str(value).split(",") if k.strip()]
+                    keywords = _parse_list_config(value)
                     if keywords:
                         site_address_mappings_new[site_domain] = keywords
                         logger.info(f"PT魔力计算器插件：保存站点地址映射 - {site_domain} -> {keywords}")
@@ -158,36 +156,66 @@ class PTBonusCalc(_PluginBase):
                 self.site_address_mappings = site_address_mappings_new
                 logger.info(f"PT魔力计算器插件初始化：更新了站点地址映射配置")
             
-            # 处理表单中的关联配置（torrent_mapping_* 字段）
+            # 关联映射：先取当前自动匹配结果，再与表单中手动选择合并，一并写入 plugindata
             mappings = self._get_torrent_mappings()
-            updated = False
+            # 1) 用当前配置拉取做种数据，得到本次自动匹配结果（站点种子 -> 下载器 hash）
+            auto_mappings = {}
+            try:
+                bonus_data = self._get_bonus_seeding_data()
+                for site_block in bonus_data:
+                    domain = site_block.get("domain", "")
+                    for row in site_block.get("torrents", []):
+                        if not row.get("downloader_hash"):
+                            continue
+                        torrent_key = _torrent_key(row.get("torrent_id"), row.get("name") or "", row.get("size", 0))
+                        if not torrent_key:
+                            continue
+                        mapping_key = f"{domain}|{torrent_key}"
+                        auto_mappings[mapping_key] = row["downloader_hash"]
+            except Exception as e:
+                logger.warning(f"PT魔力计算器插件：保存时获取自动匹配结果失败，仅保存手动选择: {e}")
+            # 2) 表单中下拉选择覆盖或新增（手动优先）
             for key, value in config.items():
-                if key.startswith("torrent_mapping_") and value:
-                    # 解析字段名：torrent_mapping_{site_domain}_{torrent_key}
-                    parts = key.replace("torrent_mapping_", "").split("_", 1)
-                    if len(parts) >= 2:
-                        site_domain = parts[0]
-                        torrent_key = parts[1].replace("_", "|").replace("__", "/")
-                        mapping_key = f"{site_domain}|{torrent_key}"
-                        if mapping_key not in mappings or mappings[mapping_key] != value:
-                            mappings[mapping_key] = value
-                            updated = True
-                            logger.info(f"PT魔力计算器插件：保存关联映射 - {mapping_key} -> {value}")
-                elif key.startswith("torrent_mapping_") and not value:
-                    # 删除关联
-                    parts = key.replace("torrent_mapping_", "").split("_", 1)
-                    if len(parts) >= 2:
-                        site_domain = parts[0]
-                        torrent_key = parts[1].replace("_", "|").replace("__", "/")
-                        mapping_key = f"{site_domain}|{torrent_key}"
-                        if mapping_key in mappings:
-                            del mappings[mapping_key]
-                            updated = True
-                            logger.info(f"PT魔力计算器插件：删除关联映射 - {mapping_key}")
-            
-            if updated:
-                self.save_data("torrent_mappings", mappings)
-                logger.info(f"PT魔力计算器插件初始化：更新了 {len(mappings)} 个关联映射")
+                if not key.startswith("torrent_mapping_"):
+                    continue
+                parts = key.replace("torrent_mapping_", "").split("_", 1)
+                if len(parts) < 2:
+                    continue
+                site_domain = parts[0]
+                torrent_key = parts[1].replace("_", "|").replace("__", "/")
+                mapping_key = f"{site_domain}|{torrent_key}"
+                if value:
+                    mappings[mapping_key] = value
+                    logger.info(f"PT魔力计算器插件：保存关联映射（表单） - {mapping_key} -> {value}")
+                elif mapping_key in mappings:
+                    del mappings[mapping_key]
+                    logger.info(f"PT魔力计算器插件：删除关联映射 - {mapping_key}")
+            # 3) 自动匹配结果填入未在表单中指定的项（合并）
+            for mk, hash_val in auto_mappings.items():
+                if mk not in mappings:
+                    mappings[mk] = hash_val
+            # 4) 写入 plugindata
+            self.save_data("torrent_mappings", mappings)
+            logger.info(f"PT魔力计算器插件初始化：关联映射已合并并写入 plugindata，共 {len(mappings)} 条")
+            # 5) 计算各站点是否全匹配，写入 plugindata，下次打开设置时全匹配站点不参与种子关联管理
+            site_fully_matched = {}
+            try:
+                for site_block in bonus_data:
+                    domain = site_block.get("domain", "")
+                    torrents = site_block.get("torrents", [])
+                    if not torrents:
+                        continue
+                    all_matched = True
+                    for row in torrents:
+                        torrent_key = _torrent_key(row.get("torrent_id"), row.get("name") or "", row.get("size", 0))
+                        if not torrent_key or f"{domain}|{torrent_key}" not in mappings:
+                            all_matched = False
+                            break
+                    site_fully_matched[domain] = all_matched
+                self.save_data("site_fully_matched", site_fully_matched)
+                logger.info(f"PT魔力计算器插件初始化：站点全匹配标识已写入 plugindata，{site_fully_matched}")
+            except Exception as e:
+                logger.warning(f"PT魔力计算器插件：写入站点全匹配标识失败: {e}")
         except Exception as e:
             logger.error(f"PT魔力计算器插件初始化失败: {e}", exc_info=True)
             raise
@@ -208,66 +236,43 @@ class PTBonusCalc(_PluginBase):
             # 确保 sites_helper 已初始化
             if not self.sites_helper:
                 self.sites_helper = SitesHelper()
-                logger.info("PT魔力计算器插件：get_form 中初始化 sites_helper")
-            
-            # 获取 Qbittorrent 下载器列表
             downloader_configs = ServiceConfigHelper.get_downloader_configs()
             qb_downloaders = [
                 {"title": conf.name, "value": conf.name}
                 for conf in downloader_configs
                 if conf.type == "qbittorrent" and conf.enabled
             ]
-            logger.info(f"PT魔力计算器插件：获取到 {len(qb_downloaders)} 个启用的 Qbittorrent 下载器")
-            
-            # 获取站点列表
             all_sites = self.sites_helper.get_indexers() or []
             enabled_sites = [
-                {
-                    "title": f"{site.get('name') or ''} ({StringUtils.get_url_domain(site.get('domain') or '')})",
-                    "value": StringUtils.get_url_domain(site.get("domain") or "")
-                }
+                {"title": f"{site.get('name') or ''} ({StringUtils.get_url_domain(site.get('domain') or '')})", "value": StringUtils.get_url_domain(site.get("domain") or "")}
                 for site in all_sites
                 if site.get("is_active") and site.get("domain")
             ]
-            logger.info(f"PT魔力计算器插件：获取到 {len(enabled_sites)} 个启用的站点用于配置选择")
+            payload = self._build_seed_association_payload(None)
+            total_unmatched_count = payload["total_unmatched_count"]
+            unmatched_by_site = payload["unmatched_by_site"]
             
-            # 获取未匹配的种子列表，按站点分组
-            unmatched_torrents_data = self._get_bonus_seeding_data()
-            unmatched_by_site = {}  # {site_domain: [torrents]}
-            total_unmatched_count = 0
-            for site_block in unmatched_torrents_data:
-                domain = site_block.get("domain", "")
-                site_name = site_block.get("site_name", "")
-                unmatched_torrents = []
-                for torrent in site_block.get("torrents", []):
-                    # 确保只统计真正未匹配的（matched字段为False或不存在）
-                    if not torrent.get("matched", False):
-                        torrent_id = torrent.get("torrent_id")
-                        name = torrent.get("name", "")
-                        size = torrent.get("size", 0)
-                        unmatched_torrents.append({
-                            "site_domain": domain,
-                            "site_name": site_name,
-                            "torrent_id": torrent_id,
-                            "name": name,
-                            "size": size,
-                            "torrent_key": torrent_id if torrent_id else f"{name}|{size}",
-                        })
-                        total_unmatched_count += 1
-                if unmatched_torrents:
-                    unmatched_by_site[domain] = {
-                        "site_name": site_name,
-                        "torrents": unmatched_torrents
-                    }
-            logger.info(f"PT魔力计算器插件：get_form 中统计到 {total_unmatched_count} 个未匹配种子，分布在 {len(unmatched_by_site)} 个站点")
-            
-            # 获取下载器种子字典，用于筛选
-            downloader_torrents_dict = {}
+            # 下载器地址关键词选项：先从已配置的站点地址映射收集（规范为域名），再在配置了同步下载器时合并 tracker 域名
+            address_keyword_options = set()
+            for keywords in self.site_address_mappings.values():
+                for kw in keywords:
+                    if not kw:
+                        continue
+                    d = self._keyword_to_domain(kw)
+                    if d:
+                        address_keyword_options.add(d)
             if self.sync_downloaders:
                 try:
-                    downloader_torrents_dict = self._fetch_downloader_torrents()
+                    downloader_torrents = self._fetch_downloader_torrents()
+                    for torrent in downloader_torrents.values():
+                        tracker = torrent.get("tracker") or ""
+                        if tracker:
+                            domain = StringUtils.get_url_domain(tracker)
+                            if domain:
+                                address_keyword_options.add(domain)
                 except Exception as e:
-                    logger.error(f"PT魔力计算器插件：获取下载器种子列表失败: {e}", exc_info=True)
+                    logger.warning(f"PT魔力计算器插件：获取下载器 tracker 域名失败: {e}")
+            address_keyword_options = sorted(address_keyword_options)
         except Exception as e:
             logger.error(f"PT魔力计算器插件：get_form 获取配置表单失败: {e}", exc_info=True)
             raise
@@ -338,7 +343,7 @@ class PTBonusCalc(_PluginBase):
                                     },
                                     {
                                         "component": "div",
-                                        "text": "配置站点域名与下载器中的地址关键词映射，用于更准确地匹配种子。例如：站点域名 lajidui.top 对应下载器中的地址关键词 ['lajidui', '垃圾堆']。",
+                                        "text": "配置站点域名与下载器中的地址关键词映射，用于更准确地匹配种子。下拉选项来自同步数据下载器中种子的 tracker 域名，可多选。",
                                         "props": {"class": "text-body-2 mb-4 text-grey"},
                                     },
                                 ],
@@ -346,18 +351,26 @@ class PTBonusCalc(_PluginBase):
                         ],
                     },
         ]
+        }
+        ]
+        
+        # 下载器地址关键词多选下拉的选项（tracker 域名 + 已配置关键词）
+        address_keyword_items = [{"title": d, "value": d} for d in address_keyword_options]
+        
+        # 站点地址映射只展示「显示站点」已选的站点；未选则展示全部启用站点
+        selected_domain_set = set(self.selected_sites) if self.selected_sites else None
+        sites_for_mapping = [s for s in enabled_sites if s.get("value") and (selected_domain_set is None or s.get("value") in selected_domain_set)]
         
         # 为每个站点添加地址映射配置
         site_mapping_rows = []
-        for site in enabled_sites:
+        for site in sites_for_mapping:
             site_domain = site.get("value", "")
             site_title = site.get("title", "")
             if not site_domain:
                 continue
             
-            # 获取该站点已配置的地址关键词
+            # 该站点已配置的地址关键词（用于多选回显）
             current_keywords = self.site_address_mappings.get(site_domain, [])
-            current_keywords_str = ",".join(current_keywords) if current_keywords else ""
             
             site_mapping_rows.append({
                 "component": "VRow",
@@ -378,11 +391,14 @@ class PTBonusCalc(_PluginBase):
                         "props": {"cols": 12, "md": 8},
                         "content": [
                             {
-                                "component": "VTextField",
+                                "component": "VSelect",
                                 "props": {
                                     "model": f"site_address_mapping_{site_domain}",
-                                    "label": "下载器地址关键词（逗号分隔）",
-                                    "hint": "例如：lajidui,垃圾堆",
+                                    "label": "下载器地址关键词",
+                                    "items": address_keyword_items,
+                                    "multiple": True,
+                                    "chips": True,
+                                    "hint": "从下载器种子 tracker 解析的域名中多选",
                                     "density": "compact",
                                 },
                             },
@@ -395,38 +411,51 @@ class PTBonusCalc(_PluginBase):
             form_items[0]["content"].extend(site_mapping_rows)
         
         form_items[0]["content"].extend([
+            {
+                "component": "VRow",
+                "content": [
                     {
-                        "component": "VRow",
+                        "component": "VCol",
+                        "props": {"cols": 12},
                         "content": [
                             {
-                                "component": "VCol",
-                                "props": {"cols": 12},
-                                "content": [
-                                    {
-                                        "component": "VDivider",
-                                        "props": {"class": "my-2"},
-                                    },
-                                    {
-                                        "component": "div",
-                                        "text": "种子关联管理",
-                                        "props": {"class": "text-h6 mb-2"},
-                                    },
-                                    {
-                                        "component": "div",
-                                        "text": f"当前有 {total_unmatched_count} 个未匹配的站点种子（分布在 {len(unmatched_by_site)} 个站点）。点击下方站点展开，为每个种子选择对应的下载器种子进行关联。保存配置后关联生效。",
-                                        "props": {"class": "text-body-2 mb-4 text-grey"},
-                                    },
-                                ],
+                                "component": "VDivider",
+                                "props": {"class": "my-2"},
+                            },
+                            {
+                                "component": "div",
+                                "text": "种子关联管理",
+                                "props": {"class": "text-h6 mb-2"},
+                            },
+                            {
+                                "component": "div",
+                                "text": f"当前有 {total_unmatched_count} 个未匹配的站点种子（分布在 {len(unmatched_by_site)} 个站点）。点击下方站点展开，为每个种子选择对应的下载器种子进行关联。保存配置后关联生效。修改「显示站点」「同步数据下载器」或「站点地址映射」后需先保存再重新打开本设置页，候选列表才会更新。",
+                                "props": {"class": "text-body-2 mb-4 text-grey"},
                             },
                         ],
                     },
-                ])
+                ],
+            },
+        ])
         
         # 按站点分组显示未匹配的种子，使用折叠面板（追加到VForm的content中）
         vform_content = form_items[0]["content"]
         
         mappings = self._get_torrent_mappings()
         default_data = {}
+        # 站点地址映射多选下拉的默认选中值（仅对当前展示的站点）；已保存的 URL 规范为域名，避免与选项重复
+        for site in sites_for_mapping:
+            site_domain = site.get("value", "")
+            if site_domain:
+                raw = self.site_address_mappings.get(site_domain, [])
+                seen = set()
+                normalized = []
+                for kw in raw:
+                    d = self._keyword_to_domain(kw)
+                    if d and d in address_keyword_options and d not in seen:
+                        seen.add(d)
+                        normalized.append(d)
+                default_data[f"site_address_mapping_{site_domain}"] = normalized
         
         # 创建站点折叠面板列表
         site_panels = []
@@ -434,67 +463,9 @@ class PTBonusCalc(_PluginBase):
         for site_domain, site_data in unmatched_by_site.items():
             site_name = site_data["site_name"]
             site_torrents = site_data["torrents"]
-            
-            # 第一步：先按站点筛选下载器种子（只保留属于当前站点的：tracker/名称含站点地址关键词）
-            site_keywords = self.site_address_mappings.get(site_domain, [])
-            if site_keywords:
-                site_filtered_dict = {}
-                for hash_value, dl_torrent in downloader_torrents_dict.items():
-                    dl_tracker = (dl_torrent.get("tracker") or "").lower()
-                    dl_name_lower = (dl_torrent.get("name") or "").lower()
-                    for kw in site_keywords:
-                        if kw and kw.lower().strip() in (dl_tracker + " " + dl_name_lower):
-                            site_filtered_dict[hash_value] = dl_torrent
-                            break
-            else:
-                site_filtered_dict = downloader_torrents_dict
-            # 若按站点筛后为空，则退回用全部下载器种子
-            if not site_filtered_dict and downloader_torrents_dict:
-                site_filtered_dict = downloader_torrents_dict
-            
-            # 为每个站点的未匹配种子创建关联选择器列表（先站点 → 再名称 → 最后大小）
             site_torrent_rows = []
             for unmatched in site_torrents:
-                site_torrent_size = unmatched['size']
-                site_torrent_name = unmatched['name']
-                size_min = site_torrent_size * 0.9
-                size_max = site_torrent_size * 1.1
-                filtered_downloader_torrents = []
-                # 第二步：在站点池内按名称相似度筛选
-                for hash_value, dl_torrent in site_filtered_dict.items():
-                    dl_size = dl_torrent.get("total_size", 0)
-                    dl_name = dl_torrent.get("name", "")
-                    similarity = self._name_similarity(site_torrent_name, dl_name) if site_torrent_name and dl_name else 0.0
-                    if similarity < 0.3:
-                        continue
-                    # 第三步：再按大小（±10%）筛选
-                    if not (size_min <= dl_size <= size_max):
-                        continue
-                    filtered_downloader_torrents.append({
-                        "title": f"{dl_name[:70]} ({StringUtils.str_filesize(dl_size)})",
-                        "value": hash_value,
-                    })
-                filtered_downloader_torrents.sort(key=lambda x: x["title"])
-                # 若名称+大小都筛不到，则放宽：仅名称>=0.3 或 仅大小±10%
-                if not filtered_downloader_torrents:
-                    for hash_value, dl_torrent in site_filtered_dict.items():
-                        dl_size = dl_torrent.get("total_size", 0)
-                        dl_name = dl_torrent.get("name", "")
-                        similarity = self._name_similarity(site_torrent_name, dl_name) if site_torrent_name and dl_name else 0.0
-                        if similarity >= 0.3 or (size_min <= dl_size <= size_max):
-                            filtered_downloader_torrents.append({
-                                "title": f"{dl_name[:70]} ({StringUtils.str_filesize(dl_size)})",
-                                "value": hash_value,
-                            })
-                    filtered_downloader_torrents.sort(key=lambda x: x["title"])
-                if not filtered_downloader_torrents and site_filtered_dict:
-                    for hash_value, dl_torrent in list(site_filtered_dict.items())[:50]:
-                        filtered_downloader_torrents.append({
-                            "title": f"{dl_torrent.get('name', '')[:70]} ({StringUtils.str_filesize(dl_torrent.get('total_size', 0))})",
-                            "value": hash_value,
-                        })
-                    filtered_downloader_torrents.sort(key=lambda x: x["title"])
-                
+                filtered_downloader_torrents = unmatched.get("options", [])
                 site_torrent_rows.append({
                     "component": "VRow",
                     "content": [
@@ -525,7 +496,7 @@ class PTBonusCalc(_PluginBase):
                                         "label": f"选择下载器种子（已筛选 {len(filtered_downloader_torrents)} 个）",
                                         "items": filtered_downloader_torrents,
                                         "clearable": True,
-                                        "hint": "已按站点→名称→大小筛选",
+                                        "hint": "已按站点地址映射筛选，可手动选择对应下载器种子",
                                         "density": "compact",
                                     },
                                 },
@@ -540,13 +511,15 @@ class PTBonusCalc(_PluginBase):
                     field_key = f"torrent_mapping_{site_domain}_{unmatched['torrent_key'].replace('|', '_').replace('/', '_')}"
                     default_data[field_key] = mappings[mapping_key]
             
-            # 创建站点折叠面板
+            # 创建站点折叠面板（只展示未匹配的站点；标题显示种子总数、已匹配数、未匹配数）
+            total_count = site_data.get("total_count", len(site_torrents))
+            matched_count = site_data.get("matched_count", total_count - len(site_torrents))
             site_panels.append({
                 "component": "VExpansionPanel",
                 "content": [
                     {
                         "component": "VExpansionPanelTitle",
-                        "text": f"{site_name}（{len(site_torrents)} 个未匹配）"
+                        "text": f"{site_name}（共 {total_count} 个做种，已匹配 {matched_count} 个，{len(site_torrents)} 个未匹配）"
                     },
                     {
                         "component": "VExpansionPanelText",
@@ -681,144 +654,81 @@ class PTBonusCalc(_PluginBase):
         ]
 
     def get_api(self) -> List[Dict[str, Any]]:
-        return [
-            {
-                "path": "/test_main_data",
-                "endpoint": self._api_test_main_data,
-                "methods": ["GET"],
-                "auth": "bear",
-                "summary": "测试主程序数据",
-                "description": "展示主程序中是否有插件需要的信息：用户当前做种信息、站点适配信息等",
-            },
-            {
-                "path": "/raw_seeding_info",
-                "endpoint": self._api_raw_seeding_info,
-                "methods": ["GET"],
-                "auth": "bear",
-                "summary": "原始做种信息",
-                "description": "输出 DB/ORM 中 seeding_info 的原始值（未经整理的格式），用于对比 site/userdata 接口的返回",
-            },
-            {
-                "path": "/bonus_seeding_list",
-                "endpoint": self._api_bonus_seeding_list,
-                "methods": ["GET"],
-                "auth": "bear",
-                "summary": "做种魔力列表",
-                "description": "各站点做种列表及每种子每小时魔力，可按魔力排序",
-            },
-            {
-                "path": "/save_torrent_mapping",
-                "endpoint": self._api_save_torrent_mapping,
-                "methods": ["POST"],
-                "auth": "bear",
-                "summary": "保存种子关联",
-                "description": "保存站点种子与下载器种子的手动关联关系",
-            },
-            {
-                "path": "/remove_torrent_mapping",
-                "endpoint": self._api_remove_torrent_mapping,
-                "methods": ["POST"],
-                "auth": "bear",
-                "summary": "删除种子关联",
-                "description": "删除站点种子与下载器种子的关联关系",
-            },
-            {
-                "path": "/unmatched_torrents",
-                "endpoint": self._api_unmatched_torrents,
-                "methods": ["GET"],
-                "auth": "bear",
-                "summary": "获取未匹配种子",
-                "description": "获取未关联下载器的站点种子列表",
-            },
-            {
-                "path": "/downloader_torrents",
-                "endpoint": self._api_downloader_torrents,
-                "methods": ["GET"],
-                "auth": "bear",
-                "summary": "获取下载器种子列表",
-                "description": "获取下载器中的种子列表，用于手动关联",
-            },
-            {
-                "path": "/associate_torrent",
-                "endpoint": self._api_associate_torrent,
-                "methods": ["POST"],
-                "auth": "bear",
-                "summary": "关联种子",
-                "description": "手动关联站点种子与下载器种子",
-            },
-            {
-                "path": "/remove_associate",
-                "endpoint": self._api_remove_associate,
-                "methods": ["POST"],
-                "auth": "bear",
-                "summary": "取消关联",
-                "description": "取消站点种子与下载器种子的关联",
-            },
+        api_specs = [
+            ("/test_main_data", self._api_test_main_data, "GET", "测试主程序数据", "展示主程序中是否有插件需要的信息：用户当前做种信息、站点适配信息等"),
+            ("/raw_seeding_info", self._api_raw_seeding_info, "GET", "原始做种信息", "输出 DB/ORM 中 seeding_info 的原始值（未经整理的格式），用于对比 site/userdata 接口的返回"),
+            ("/bonus_seeding_list", self._api_bonus_seeding_list, "GET", "做种魔力列表", "各站点做种列表及每种子每小时魔力，可按魔力排序"),
+            ("/save_torrent_mapping", self._api_save_torrent_mapping, "POST", "保存种子关联", "保存站点种子与下载器种子的手动关联关系"),
+            ("/remove_torrent_mapping", self._api_remove_torrent_mapping, "POST", "删除种子关联", "删除站点种子与下载器种子的关联关系"),
+            ("/unmatched_torrents", self._api_unmatched_torrents, "GET", "获取未匹配种子", "获取未关联下载器的站点种子列表"),
+            ("/downloader_torrents", self._api_downloader_torrents, "GET", "获取下载器种子列表", "获取下载器中的种子列表，用于手动关联"),
+            ("/associate_torrent", self._api_associate_torrent, "POST", "关联种子", "手动关联站点种子与下载器种子"),
+            ("/remove_associate", self._api_remove_associate, "POST", "取消关联", "取消站点种子与下载器种子的关联"),
+            ("/seed_association_data", self._api_seed_association_data, "POST", "获取种子关联数据（可传当前表单配置）", "用当前或传入的 selected_sites/sync_downloaders/site_address_mappings 计算未匹配列表与每行下拉候选，供前端「不保存即刷新」使用"),
         ]
+        return [{"path": p, "endpoint": e, "methods": [m], "auth": "bear", "summary": s, "description": d} for p, e, m, s, d in api_specs]
+
+    def _get_sites_to_query(self, site_id: Optional[str] = None, filter_by_selected_sites: bool = True) -> List[Dict[str, Any]]:
+        """根据 site_id 或配置获取待查询站点列表。filter_by_selected_sites 为 True 时在未传 site_id 情况下按 selected_sites 过滤。"""
+        if site_id:
+            try:
+                sid = int(site_id)
+            except (TypeError, ValueError):
+                sid = None
+                logger.error(f"PT魔力计算器插件：无效的 site_id={site_id}")
+            site_info = self.site_oper.get(sid) if sid else None
+            if site_info:
+                indexer = self.sites_helper.get_indexer(site_info.domain)
+                if indexer:
+                    return [indexer]
+            return []
+        all_sites = [s for s in (self.sites_helper.get_indexers() or []) if s.get("is_active")]
+        if filter_by_selected_sites and self.selected_sites:
+            selected_domains = set(self.selected_sites)
+            return [s for s in all_sites if StringUtils.get_url_domain(s.get("domain") or "") in selected_domains]
+        return all_sites
+
+    def _get_latest_userdata(self, domain_key: str):
+        """按域名取最新一条用户数据（按 updated_day/updated_time 降序取第一条）。"""
+        userdata_list = self.site_oper.get_userdata_by_domain(domain_key)
+        if userdata_list and len(userdata_list) > 1:
+            userdata_list = sorted(
+                userdata_list,
+                key=lambda u: (u.updated_day or "", u.updated_time or ""),
+                reverse=True,
+            )
+        return userdata_list[0] if userdata_list else None
+
+    def _keyword_to_domain(self, kw: Optional[str]) -> str:
+        """将配置中的关键词/URL 规范为域名（用于下拉选项等）；非 URL 则返回原串 strip。"""
+        if not kw:
+            return ""
+        k = str(kw).strip()
+        if "://" in k or ("." in k and "/" in k):
+            return StringUtils.get_url_domain(k) or k
+        return k
 
     def _get_bonus_seeding_data(self, site_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """获取各站点做种列表及每种子魔力（按每小时魔力降序），包含下载器关联数据。"""
         try:
-            sites_to_query = []
-            if site_id:
-                try:
-                    sid = int(site_id)
-                    logger.info(f"PT魔力计算器插件：查询指定站点 site_id={site_id}")
-                except (TypeError, ValueError):
-                    sid = None
-                    logger.error(f"PT魔力计算器插件：无效的 site_id={site_id}")
-                site_info = self.site_oper.get(sid) if sid else None
-                if site_info:
-                    indexer = self.sites_helper.get_indexer(site_info.domain)
-                    if indexer:
-                        sites_to_query.append(indexer)
-                        logger.info(f"PT魔力计算器插件：找到站点 {site_info.domain}")
-            else:
-                all_sites = [s for s in (self.sites_helper.get_indexers() or []) if s.get("is_active")]
-                logger.info(f"PT魔力计算器插件：获取到 {len(all_sites)} 个启用站点")
-                # 如果配置了站点选择，则只显示选中的站点
-                if self.selected_sites:
-                    selected_domains = set(self.selected_sites)
-                    logger.info(f"PT魔力计算器插件：站点过滤配置生效，选中的站点域名 = {selected_domains}")
-                    sites_to_query = [
-                        s for s in all_sites
-                        if StringUtils.get_url_domain(s.get("domain") or "") in selected_domains
-                    ]
-                    logger.info(f"PT魔力计算器插件：过滤后剩余 {len(sites_to_query)} 个站点")
-                else:
-                    sites_to_query = all_sites
-                    logger.info(f"PT魔力计算器插件：未配置站点过滤，显示所有 {len(sites_to_query)} 个启用站点")
+            sites_to_query = self._get_sites_to_query(site_id, filter_by_selected_sites=True)
         except Exception as e:
             logger.error(f"PT魔力计算器插件：_get_bonus_seeding_data 获取站点列表失败: {e}", exc_info=True)
             raise
 
         # 拉取下载器种子数据（如果配置了同步数据下载器）
-        downloader_torrents = {}
         if self.sync_downloaders:
-            logger.info(f"PT魔力计算器插件：开始从 {len(self.sync_downloaders)} 个下载器拉取种子数据，下载器列表 = {self.sync_downloaders}")
             downloader_torrents = self._fetch_downloader_torrents()
-            logger.info(f"PT魔力计算器插件：从下载器共获取到 {len(downloader_torrents)} 个种子")
-            # 输出下载器种子名称样本（前10个），便于对比匹配
-            if downloader_torrents:
-                sample_count = min(10, len(downloader_torrents))
-                logger.info(f"PT魔力计算器插件：下载器种子名称样本（前{sample_count}个）：")
-                for idx, (hash_val, torrent) in enumerate(list(downloader_torrents.items())[:sample_count]):
-                    logger.info(f"  {idx+1}. 名称={torrent.get('name', '')[:80]}, 大小={torrent.get('total_size', 0)}字节")
+            torrents_by_domain = self._build_torrents_by_tracker_domain(downloader_torrents)
         else:
-            logger.info("PT魔力计算器插件：未配置同步数据下载器，跳过下载器种子拉取")
+            downloader_torrents = {}
+            torrents_by_domain = {}
 
         result = []
         for site in sites_to_query:
             try:
                 domain_key = StringUtils.get_url_domain(site.get("domain") or "")
-                userdata_list = self.site_oper.get_userdata_by_domain(domain_key)
-                if userdata_list and len(userdata_list) > 1:
-                    userdata_list = sorted(
-                        userdata_list,
-                        key=lambda u: (u.updated_day or "", u.updated_time or ""),
-                        reverse=True,
-                    )
-                userdata = userdata_list[0] if userdata_list else None
+                userdata = self._get_latest_userdata(domain_key)
                 if not userdata:
                     logger.warning(f"PT魔力计算器插件：站点 {domain_key} 没有用户数据，跳过")
                     continue
@@ -840,13 +750,6 @@ class PTBonusCalc(_PluginBase):
             has_params = all((T0, N0, B0, L))
 
             rows = []
-            matched_count = 0
-            unmatched_count = 0
-            unmatched_samples = []  # 记录未匹配的样本（用于日志输出）
-            max_unmatched_samples = 3  # 最多记录3个未匹配样本
-            
-            logger.info(f"PT魔力计算器插件：站点 {domain_key} 开始处理 {len(seeding_list)} 个做种记录")
-            
             for idx, s in enumerate(seeding_list):
                 if not isinstance(s, dict):
                     continue
@@ -874,23 +777,13 @@ class PTBonusCalc(_PluginBase):
                 matched_hash = None
                 downloader_data = None
                 if downloader_torrents:
-                    # 对于前几个未匹配的种子，输出详细日志
-                    debug_match = unmatched_count < max_unmatched_samples
-                    matched_hash = self._match_torrent(s, domain_key, downloader_torrents, debug=debug_match)
+                    # 配置了站点地址映射则从按 tracker 分组的 map 中取该站对应数组，再名称+大小匹配
+                    candidate_torrents = self._get_candidate_torrents_for_site(
+                        domain_key, downloader_torrents, torrents_by_domain
+                    )
+                    matched_hash, _ = self._match_torrent(s, domain_key, candidate_torrents)
                     if matched_hash and matched_hash in downloader_torrents:
                         downloader_data = downloader_torrents[matched_hash]
-                        matched_count += 1
-                    else:
-                        unmatched_count += 1
-                        # 记录未匹配样本
-                        if len(unmatched_samples) < max_unmatched_samples:
-                            unmatched_samples.append({
-                                "name": s.get("name") or "",
-                                "size": size_b,
-                                "torrent_id": s.get("torrent_id")
-                            })
-                else:
-                    unmatched_count += 1
                 
                 row_data = {
                     "name": s.get("name") or "—",
@@ -918,14 +811,6 @@ class PTBonusCalc(_PluginBase):
                     })
                 
                 rows.append(row_data)
-            
-            # 记录匹配统计
-            if downloader_torrents:
-                logger.info(f"PT魔力计算器插件：站点 {domain_key} 做种数 {len(rows)}，匹配下载器种子 {matched_count} 个，未匹配 {unmatched_count} 个")
-                if unmatched_count > 0 and unmatched_samples:
-                    logger.info(f"PT魔力计算器插件：未匹配样本（前{len(unmatched_samples)}个）：")
-                    for sample in unmatched_samples:
-                        logger.info(f"  - 名称={sample['name'][:60]}, 大小={sample['size']}, torrent_id={sample.get('torrent_id', 'N/A')}")
             
             rows.sort(key=lambda x: x["bonus_per_hour"], reverse=True)
             # 与站点一致：每小时总魔力 = 公式 B（B0*(2/π)*atan(总A/L)）+ 做种数奖励（若 mybonus 页有解析到）
@@ -965,37 +850,14 @@ class PTBonusCalc(_PluginBase):
         - parser 解析网页信息
         参数: site_id 可选，不传则返回全部启用站点；refresh=1 则先刷新再返回
         """
-        sites_to_query = []
-        if site_id:
-            try:
-                sid = int(site_id)
-            except (TypeError, ValueError):
-                sid = None
-            site_info = self.site_oper.get(sid) if sid else None
-            if site_info:
-                indexer = self.sites_helper.get_indexer(site_info.domain)
-                if indexer:
-                    sites_to_query.append(indexer)
-        else:
-            sites_to_query = [s for s in (self.sites_helper.get_indexers() or []) if s.get("is_active")]
-
+        sites_to_query = self._get_sites_to_query(site_id, filter_by_selected_sites=False)
         result = {"sites": [], "message": ""}
         for site in sites_to_query:
             domain = site.get("domain") or ""
-
             if refresh:
                 SiteChain().refresh_userdata(site=site)
-
             domain_key = StringUtils.get_url_domain(domain)
-            userdata_list = self.site_oper.get_userdata_by_domain(domain_key)
-            if userdata_list and len(userdata_list) > 1:
-                userdata_list = sorted(
-                    userdata_list,
-                    key=lambda u: (u.updated_day or "", u.updated_time or ""),
-                    reverse=True,
-                )
-            userdata = userdata_list[0] if userdata_list else None
-
+            userdata = self._get_latest_userdata(domain_key)
             site_result = dict(site)
             schema_val = site.get("parser") or site.get("schema") or ""
             site_result["parser"] = schema_val
@@ -1042,36 +904,14 @@ class PTBonusCalc(_PluginBase):
         用于对比 site/userdata 接口的返回格式。
         参数: site_id 可选；refresh=1 则先刷新再返回
         """
-        sites_to_query = []
-        if site_id:
-            try:
-                sid = int(site_id)
-            except (TypeError, ValueError):
-                sid = None
-            site_info = self.site_oper.get(sid) if sid else None
-            if site_info:
-                indexer = self.sites_helper.get_indexer(site_info.domain)
-                if indexer:
-                    sites_to_query.append(indexer)
-        else:
-            sites_to_query = [s for s in (self.sites_helper.get_indexers() or []) if s.get("is_active")]
-
+        sites_to_query = self._get_sites_to_query(site_id, filter_by_selected_sites=False)
         result = {"sites": [], "message": ""}
         for site in sites_to_query:
             domain = site.get("domain") or ""
             if refresh:
                 SiteChain().refresh_userdata(site=site)
-
             domain_key = StringUtils.get_url_domain(domain)
-            userdata_list = self.site_oper.get_userdata_by_domain(domain_key)
-            if userdata_list and len(userdata_list) > 1:
-                userdata_list = sorted(
-                    userdata_list,
-                    key=lambda u: (u.updated_day or "", u.updated_time or ""),
-                    reverse=True,
-                )
-            userdata = userdata_list[0] if userdata_list else None
-
+            userdata = self._get_latest_userdata(domain_key)
             item = {
                 "name": site.get("name"),
                 "domain": domain_key,
@@ -1112,17 +952,14 @@ class PTBonusCalc(_PluginBase):
             return None
 
     def _fetch_downloader_torrents(self) -> Dict[str, Dict[str, Any]]:
-        """从配置的下载器中拉取全部种子数据"""
+        """从配置的下载器中拉取全部种子数据，返回 hash -> 加工数据。"""
         all_torrents = {}
         for downloader_name in self.sync_downloaders:
-            logger.info(f"PT魔力计算器插件：开始从下载器 {downloader_name} 拉取种子")
             qb_instance = self._get_qb_instance(downloader_name)
             if not qb_instance:
                 logger.warning(f"PT魔力计算器插件：无法获取下载器 {downloader_name} 的实例，跳过")
                 continue
             try:
-                # 获取全部种子（不传 status，包含所有状态）
-                # get_torrents 返回 (torrents_list, error)
                 torrents, error = qb_instance.get_torrents()
                 if error:
                     logger.error(f"PT魔力计算器插件：从下载器 {downloader_name} 获取种子时出错: {error}")
@@ -1130,20 +967,14 @@ class PTBonusCalc(_PluginBase):
                 if not torrents:
                     logger.warning(f"PT魔力计算器插件：从下载器 {downloader_name} 获取到 0 个种子")
                     continue
-                
-                torrent_count = 0
                 for torrent in torrents:
                     hash_value = torrent.get("hash")
                     if not hash_value:
                         continue
-                    # 获取tracker信息（如果可用）
                     tracker = torrent.get("tracker") or ""
-                    tags = torrent.get("tags") or []
-                    if isinstance(tags, str):
-                        tags = [t.strip() for t in tags.split(",") if t.strip()]
-                    elif not isinstance(tags, list):
-                        tags = []
-                    
+                    if not tracker and isinstance(torrent.get("trackers"), list) and torrent["trackers"]:
+                        first = torrent["trackers"][0]
+                        tracker = (first.get("url") if isinstance(first, dict) else str(first)) or ""
                     all_torrents[hash_value] = {
                         "hash": hash_value,
                         "downloader": downloader_name,
@@ -1155,13 +986,74 @@ class PTBonusCalc(_PluginBase):
                         "seeding_time": torrent.get("seeding_time") or 0,
                         "state": torrent.get("state") or "",
                         "tracker": tracker,
-                        "tags": tags,
                     }
-                    torrent_count += 1
-                logger.info(f"PT魔力计算器插件：从下载器 {downloader_name} 成功获取到 {torrent_count} 个种子")
             except Exception as e:
                 logger.error(f"PT魔力计算器插件：拉取下载器 {downloader_name} 种子失败: {e}", exc_info=True)
         return all_torrents
+
+    def _tracker_domain_group_key(self, tracker: str) -> str:
+        """从 tracker URL 取二级或一级域名作为分组键（与 StringUtils.get_url_domain 一致：最后两级）。"""
+        if not (tracker or "").strip():
+            return "__no_tracker__"
+        domain = StringUtils.get_url_domain(tracker.strip())
+        return domain or "__no_tracker__"
+
+    def _build_torrents_by_tracker_domain(
+        self, downloader_torrents: Dict[str, Dict[str, Any]]
+    ) -> Dict[str, List[str]]:
+        """按 tracker 的二级/一级域名分组，返回 group_key -> [hash, ...]。只做分组，不输出原始数据。"""
+        by_domain: Dict[str, List[str]] = {}
+        for hash_value, t in downloader_torrents.items():
+            tracker = (t.get("tracker") or "").strip()
+            gk = self._tracker_domain_group_key(tracker)
+            by_domain.setdefault(gk, []).append(hash_value)
+        return by_domain
+
+    def _get_candidate_torrents_for_site(
+        self,
+        site_domain: str,
+        downloader_torrents: Dict[str, Dict[str, Any]],
+        torrents_by_domain: Dict[str, List[str]],
+    ) -> Dict[str, Dict[str, Any]]:
+        """若配置了站点地址映射，从按 tracker 分组的 map 中取出该站对应域名的种子子集再匹配；未配置则返回全部。"""
+        keywords = self.site_address_mappings.get(site_domain, [])
+        if not keywords:
+            return downloader_torrents
+        keyword_domains = set()
+        for kw in keywords:
+            k = (kw or "").strip()
+            if not k:
+                continue
+            d = StringUtils.get_url_domain(k) or k.lower()
+            if d:
+                keyword_domains.add(d)
+        if not keyword_domains:
+            return downloader_torrents
+        candidate_hashes = []
+        for gk, hashes in torrents_by_domain.items():
+            if gk in keyword_domains:
+                candidate_hashes.extend(hashes)
+        if not candidate_hashes:
+            return downloader_torrents
+        return {h: downloader_torrents[h] for h in candidate_hashes if h in downloader_torrents}
+
+    def _downloader_torrents_list(self, keyword: Optional[str] = None) -> List[Dict[str, Any]]:
+        """从配置的下载器拉取种子并转为列表，可选按名称关键词筛选，按名称排序。"""
+        downloader_torrents = self._fetch_downloader_torrents()
+        result = []
+        for hash_value, torrent in downloader_torrents.items():
+            name = torrent.get("name", "")
+            if keyword and keyword.lower() not in name.lower():
+                continue
+            result.append({
+                "hash": hash_value,
+                "name": name,
+                "size": torrent.get("total_size", 0),
+                "ratio": torrent.get("ratio", 0.0),
+                "downloader": torrent.get("downloader", ""),
+            })
+        result.sort(key=lambda x: x.get("name", ""))
+        return result
 
     def _get_torrent_mappings(self) -> Dict[str, str]:
         """获取手动关联映射关系"""
@@ -1187,6 +1079,116 @@ class PTBonusCalc(_PluginBase):
         if mapping_key in mappings:
             del mappings[mapping_key]
             self.save_data("torrent_mappings", mappings)
+
+    def _build_seed_association_payload(self, override_config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        按当前或给定配置计算「未匹配种子 + 每行下拉候选」，供 get_form 与「用当前表单状态刷新」API 共用。
+        override_config 可选：{ "selected_sites": [], "sync_downloaders": [], "site_address_mappings": {} }
+        """
+        backup = {
+            "selected_sites": self.selected_sites,
+            "sync_downloaders": self.sync_downloaders,
+            "site_address_mappings": dict(self.site_address_mappings),
+        }
+        try:
+            if override_config:
+                if "selected_sites" in override_config:
+                    self.selected_sites = _parse_list_config(override_config["selected_sites"])
+                if "sync_downloaders" in override_config:
+                    self.sync_downloaders = _parse_list_config(override_config["sync_downloaders"])
+                if "site_address_mappings" in override_config and isinstance(override_config["site_address_mappings"], dict):
+                    self.site_address_mappings = {k: (v if isinstance(v, list) else [str(v)]) for k, v in override_config["site_address_mappings"].items()}
+
+            if not self.sites_helper:
+                self.sites_helper = SitesHelper()
+            unmatched_torrents_data = self._get_bonus_seeding_data()
+            unmatched_by_site = {}
+            total_unmatched_count = 0
+            for site_block in unmatched_torrents_data:
+                domain = site_block.get("domain", "")
+                site_name = site_block.get("site_name", "")
+                all_torrents = site_block.get("torrents", [])
+                unmatched_torrents = []
+                for torrent in all_torrents:
+                    if not torrent.get("matched", False):
+                        torrent_id = torrent.get("torrent_id")
+                        name = torrent.get("name", "")
+                        size = torrent.get("size", 0)
+                        unmatched_torrents.append({
+                            "site_domain": domain,
+                            "site_name": site_name,
+                            "torrent_id": torrent_id,
+                            "name": name,
+                            "size": size,
+                            "torrent_key": _torrent_key(torrent_id, name, size),
+                        })
+                        total_unmatched_count += 1
+                if unmatched_torrents:
+                    total_count = len(all_torrents)
+                    matched_count = total_count - len(unmatched_torrents)
+                    unmatched_by_site[domain] = {
+                        "site_name": site_name,
+                        "torrents": unmatched_torrents,
+                        "total_count": total_count,
+                        "matched_count": matched_count,
+                    }
+            # 全匹配的站点不参与种子关联管理（不再展示下拉）
+            site_fully_matched = self.get_data(key="site_fully_matched") or {}
+            if isinstance(site_fully_matched, dict):
+                for domain in list(unmatched_by_site.keys()):
+                    if site_fully_matched.get(domain) is True:
+                        total_unmatched_count -= len(unmatched_by_site[domain]["torrents"])
+                        del unmatched_by_site[domain]
+
+            downloader_torrents_dict = {}
+            if self.sync_downloaders:
+                try:
+                    downloader_torrents_dict = self._fetch_downloader_torrents()
+                except Exception as e:
+                    logger.error(f"PT魔力计算器插件：_build_seed_association_payload 获取下载器种子失败: {e}", exc_info=True)
+
+            # 为每个站点、每个未匹配种子计算下拉候选（含按域名放宽的站点池）
+            for site_domain, site_data in unmatched_by_site.items():
+                site_keywords = self.site_address_mappings.get(site_domain, [])
+                match_terms = set()
+                for kw in site_keywords:
+                    k = (kw or "").strip()
+                    if not k:
+                        continue
+                    match_terms.add(k.lower())
+                    d = self._keyword_to_domain(k)
+                    if d:
+                        match_terms.add(d.lower())
+                site_filtered_dict = {}
+                for hash_value, dl_torrent in downloader_torrents_dict.items():
+                    dl_tracker = (dl_torrent.get("tracker") or "").lower()
+                    dl_name_lower = (dl_torrent.get("name") or "").lower()
+                    combined = dl_tracker + " " + dl_name_lower
+                    for term in match_terms:
+                        if term and term in combined:
+                            site_filtered_dict[hash_value] = dl_torrent
+                            break
+                if not site_filtered_dict and downloader_torrents_dict:
+                    site_filtered_dict = downloader_torrents_dict
+                # 若配置了站点关键词但按地址只筛出很少（如≤10 或不足总数 5%），多半是下载器未返回 tracker，下拉改用全部种子
+                total_dl = len(downloader_torrents_dict)
+                if site_keywords and total_dl > 0 and len(site_filtered_dict) <= max(10, int(total_dl * 0.05)):
+                    site_filtered_dict = downloader_torrents_dict
+
+                # 按映射地址筛出的总条数；未匹配的站点种子其下拉中展示该站点下全部（地址已筛）下载器种子，由用户手动选
+                site_filtered_list = [
+                    {"title": f"{dl_torrent.get('name', '')[:70]} ({StringUtils.str_filesize(dl_torrent.get('total_size', 0))})", "value": hash_value}
+                    for hash_value, dl_torrent in site_filtered_dict.items()
+                ]
+                site_filtered_list.sort(key=lambda x: x["title"])
+                for unmatched in site_data["torrents"]:
+                    unmatched["options"] = site_filtered_list
+
+            return {"total_unmatched_count": total_unmatched_count, "unmatched_by_site": unmatched_by_site}
+        finally:
+            self.selected_sites = backup["selected_sites"]
+            self.sync_downloaders = backup["sync_downloaders"]
+            self.site_address_mappings = backup["site_address_mappings"]
 
     def _normalize_name(self, name: str) -> str:
         """标准化种子名称，去除特殊字符，便于匹配"""
@@ -1229,97 +1231,31 @@ class PTBonusCalc(_PluginBase):
         total_words = words1 | words2
         return len(common_words) / len(total_words) if total_words else 0.0
     
-    def _match_torrent(self, site_torrent: Dict[str, Any], site_domain: str, downloader_torrents: Dict[str, Dict[str, Any]], debug: bool = False) -> Optional[str]:
-        """匹配站点种子与下载器种子，返回下载器 hash"""
+    def _match_torrent(self, site_torrent: Dict[str, Any], site_domain: str, downloader_torrents: Dict[str, Dict[str, Any]]) -> Tuple[Optional[str], Optional[str]]:
+        """匹配站点种子与下载器种子，返回 (下载器 hash, 成功原因) 或 (None, None)。"""
         torrent_id = site_torrent.get("torrent_id")
         name = site_torrent.get("name") or ""
         size = float(site_torrent.get("size") or 0)
-        
-        if debug:
-            logger.info(f"PT魔力计算器插件：开始匹配站点种子 - 站点={site_domain}, 名称={name[:80]}, 大小={size}字节, torrent_id={torrent_id}")
-        
-        # 1. 优先使用手动映射
+
         mappings = self._get_torrent_mappings()
         if torrent_id:
             mapping_key = f"{site_domain}|{torrent_id}"
             if mapping_key in mappings:
-                matched_hash = mappings[mapping_key]
-                if debug:
-                    logger.info(f"PT魔力计算器插件：通过手动映射(torrent_id)匹配成功，hash={matched_hash}")
-                return matched_hash
-        # 使用 name+size 作为键
+                return (mappings[mapping_key], "手动映射(torrent_id)")
         mapping_key = f"{site_domain}|{name}|{size}"
         if mapping_key in mappings:
-            matched_hash = mappings[mapping_key]
-            if debug:
-                logger.info(f"PT魔力计算器插件：通过手动映射(name+size)匹配成功，hash={matched_hash}")
-            return matched_hash
-        
-        # 2. 自动匹配：name + size（允许 ±1% 误差）
+            return (mappings[mapping_key], "手动映射(name+size)")
+
         if not name or size <= 0:
-            if debug:
-                logger.info(f"PT魔力计算器插件：匹配失败 - 站点种子名称或大小为空（name={name[:50] if name else 'None'}, size={size}）")
-            return None
+            return (None, None)
         
         size_min = size * 0.99
         size_max = size * 1.01
-        site_name_normalized = self._normalize_name(name)
-        
-        # 获取站点地址映射关键词（用于优先匹配）
-        site_address_keywords = self.site_address_mappings.get(site_domain, [])
-        
-        # 统计匹配尝试
-        name_matched_count = 0
-        size_matched_count = 0
-        best_match_info = None  # 记录最接近的匹配（名称匹配但大小不匹配）
-        best_similarity = 0.0
-        
-        # 先按大小筛选候选（提高性能）
-        size_candidates = []
-        address_matched_candidates = []  # 通过站点地址映射匹配的候选（优先）
-        for hash_value, dl_torrent in downloader_torrents.items():
-            dl_size = dl_torrent.get("total_size") or 0
-            
-            # 检查是否通过站点地址映射匹配（tracker或名称包含关键词）
-            address_matched = False
-            if site_address_keywords:
-                dl_tracker = dl_torrent.get("tracker", "").lower()
-                dl_name_lower = (dl_torrent.get("name") or "").lower()
-                for keyword in site_address_keywords:
-                    keyword_lower = keyword.lower().strip()
-                    if keyword_lower and (keyword_lower in dl_tracker or keyword_lower in dl_name_lower):
-                        address_matched = True
-                        if debug:
-                            logger.debug(f"PT魔力计算器插件：站点地址映射匹配 - 站点={site_domain}, 关键词={keyword}, "
-                                       f"下载器种子={dl_torrent.get('name', '')[:50]}, tracker={dl_tracker[:50]}")
-                        break
-            
-            if size_min <= dl_size <= size_max:
-                if address_matched:
-                    address_matched_candidates.append((hash_value, dl_torrent))
-                else:
-                    size_candidates.append((hash_value, dl_torrent))
-        
-        # 优先检查通过站点地址映射匹配的候选
-        if address_matched_candidates:
-            if debug:
-                logger.info(f"PT魔力计算器插件：找到 {len(address_matched_candidates)} 个通过站点地址映射匹配的候选")
-            for hash_value, dl_torrent in address_matched_candidates:
-                dl_name = dl_torrent.get("name") or ""
-                dl_size = dl_torrent.get("total_size") or 0
-                
-                # 名称相似度检查
-                similarity = self._name_similarity(name, dl_name)
-                name_matched = similarity >= 0.3  # 地址映射匹配时降低相似度阈值
-                
-                if name_matched:
-                    name_matched_count += 1
-                    if debug:
-                        logger.info(f"PT魔力计算器插件：通过站点地址映射自动匹配成功 - 相似度={similarity:.2f}, "
-                                   f"站点种子名称={name[:60]}, 下载器种子名称={dl_name[:60]}, "
-                                   f"站点大小={size}字节, 下载器大小={dl_size}字节")
-                    return hash_value
-        
+        size_candidates = [
+            (hash_value, dl_torrent)
+            for hash_value, dl_torrent in downloader_torrents.items()
+            if size_min <= (dl_torrent.get("total_size") or 0) <= size_max
+        ]
         # 如果大小匹配的候选很多，优先检查名称相似度高的
         if len(size_candidates) > 100:
             # 计算相似度并排序
@@ -1331,78 +1267,13 @@ class PTBonusCalc(_PluginBase):
             candidates_with_sim.sort(reverse=True, key=lambda x: x[0])
             size_candidates = [(h, t) for _, h, t in candidates_with_sim[:50]]  # 只检查前50个最相似的
         
-        # 遍历大小匹配的候选
         for hash_value, dl_torrent in size_candidates:
             dl_name = dl_torrent.get("name") or ""
             dl_size = dl_torrent.get("total_size") or 0
-            
-            # 名称相似度检查（改进版）
             similarity = self._name_similarity(name, dl_name)
-            name_matched = similarity >= 0.5  # 相似度阈值50%
-            
-            if name_matched:
-                name_matched_count += 1
-                # 大小匹配（允许 ±1% 误差）
-                if size_min <= dl_size <= size_max:
-                    size_matched_count += 1
-                    if debug:
-                        logger.info(f"PT魔力计算器插件：自动匹配成功 - 相似度={similarity:.2f}, 站点种子名称={name[:60]}, "
-                                   f"下载器种子名称={dl_name[:60]}, 站点大小={size}字节, 下载器大小={dl_size}字节")
-                    return hash_value
-                else:
-                    # 记录最接近的匹配（名称匹配但大小不匹配）
-                    if similarity > best_similarity:
-                        best_similarity = similarity
-                        best_match_info = {
-                            "hash": hash_value,
-                            "name": dl_name,
-                            "size": dl_size,
-                            "size_diff": abs(dl_size - size),
-                            "size_diff_percent": abs(dl_size - size) / size * 100 if size > 0 else 0,
-                            "similarity": similarity
-                        }
-        
-        # 如果大小匹配的候选中没有找到，再检查所有下载器种子（名称匹配但大小不匹配的情况）
-        if not best_match_info:
-            for hash_value, dl_torrent in downloader_torrents.items():
-                dl_name = dl_torrent.get("name") or ""
-                dl_size = dl_torrent.get("total_size") or 0
-                similarity = self._name_similarity(name, dl_name)
-                
-                if similarity >= 0.5:
-                    name_matched_count += 1
-                    if best_match_info is None or similarity > best_similarity:
-                        best_similarity = similarity
-                        best_match_info = {
-                            "hash": hash_value,
-                            "name": dl_name,
-                            "size": dl_size,
-                            "size_diff": abs(dl_size - size),
-                            "size_diff_percent": abs(dl_size - size) / size * 100 if size > 0 else 0,
-                            "similarity": similarity
-                        }
-        
-        # 匹配失败，输出统计信息和对比样本（使用 INFO 级别，便于排查）
-        if debug:
-            logger.info(f"PT魔力计算器插件：匹配失败详情 - 站点={site_domain}, 站点种子名称={name[:100]}, 站点大小={size}字节")
-            logger.info(f"PT魔力计算器插件：匹配统计 - 大小匹配候选数={len(size_candidates)}, 名称相似度>=0.5的种子数={name_matched_count}, 大小也匹配的种子数={size_matched_count}")
-            if best_match_info:
-                logger.info(f"PT魔力计算器插件：最接近的匹配 - 相似度={best_match_info.get('similarity', 0):.2f}, "
-                           f"下载器种子名称={best_match_info['name'][:100]}, 下载器大小={best_match_info['size']}字节, "
-                           f"大小差异={best_match_info['size_diff']:.0f}字节 ({best_match_info['size_diff_percent']:.2f}%)")
-            elif name_matched_count == 0:
-                logger.info(f"PT魔力计算器插件：未找到名称相似的下载器种子（相似度阈值>=0.5）")
-                # 输出一些下载器种子名称作为对比参考（前5个）
-                sample_torrents = list(downloader_torrents.items())[:5]
-                if sample_torrents:
-                    logger.info(f"PT魔力计算器插件：下载器种子名称对比样本（前5个，用于排查名称差异）：")
-                    for idx, (hash_val, dl_torrent) in enumerate(sample_torrents):
-                        dl_name = dl_torrent.get("name", "")[:100]
-                        dl_size = dl_torrent.get("total_size", 0)
-                        similarity = self._name_similarity(name, dl_name)
-                        logger.info(f"  {idx+1}. 下载器种子名称={dl_name}, 大小={dl_size}字节, 相似度={similarity:.2f}")
-        
-        return None
+            if similarity >= 0.5 and size_min <= dl_size <= size_max:
+                return (hash_value, f"大小+名称相似度({similarity:.2f})")
+        return (None, None)
 
     def _format_seeding_time(self, seconds: int) -> str:
         """格式化做种时长"""
@@ -1461,7 +1332,7 @@ class PTBonusCalc(_PluginBase):
                             "torrent_id": torrent_id,
                             "name": name,
                             "size": size,
-                            "torrent_key": torrent_id if torrent_id else f"{name}|{size}",
+                            "torrent_key": _torrent_key(torrent_id, name, size),
                         })
             return {"success": True, "unmatched": unmatched, "count": len(unmatched)}
         except Exception as e:
@@ -1470,25 +1341,8 @@ class PTBonusCalc(_PluginBase):
     def _api_downloader_torrents(self, site_domain: Optional[str] = Query(None), keyword: Optional[str] = Query(None)):
         """API：获取下载器种子列表，用于手动关联"""
         try:
-            downloader_torrents = self._fetch_downloader_torrents()
-            result = []
-            for hash_value, torrent in downloader_torrents.items():
-                name = torrent.get("name", "")
-                # 如果提供了站点域名和关键词，进行筛选
-                if site_domain and keyword:
-                    # 简单匹配：名称包含关键词
-                    if keyword.lower() not in name.lower():
-                        continue
-                result.append({
-                    "hash": hash_value,
-                    "name": name,
-                    "size": torrent.get("total_size", 0),
-                    "ratio": torrent.get("ratio", 0.0),
-                    "downloader": torrent.get("downloader", ""),
-                })
-            # 按名称排序
-            result.sort(key=lambda x: x.get("name", ""))
-            return {"success": True, "torrents": result, "count": len(result)}
+            lst = self._downloader_torrents_list(keyword=keyword)
+            return {"success": True, "torrents": lst, "count": len(lst)}
         except Exception as e:
             return {"success": False, "message": f"获取失败: {str(e)}"}
     
@@ -1503,31 +1357,11 @@ class PTBonusCalc(_PluginBase):
                 return {"success": False, "message": "参数不完整"}
             
             if downloader_hash:
-                # 保存关联
                 self._save_torrent_mapping(site_domain, torrent_key, downloader_hash)
                 logger.info(f"PT魔力计算器插件：手动关联成功 - 站点={site_domain}, 种子={torrent_key}, 下载器hash={downloader_hash}")
                 return {"success": True, "message": "关联成功"}
-            else:
-                # 返回下载器种子列表供选择
-                downloader_torrents = self._fetch_downloader_torrents()
-                result = []
-                for hash_value, torrent in downloader_torrents.items():
-                    result.append({
-                        "hash": hash_value,
-                        "name": torrent.get("name", ""),
-                        "size": torrent.get("total_size", 0),
-                        "ratio": torrent.get("ratio", 0.0),
-                        "downloader": torrent.get("downloader", ""),
-                    })
-                # 按名称排序
-                result.sort(key=lambda x: x.get("name", ""))
-                return {
-                    "success": True,
-                    "torrents": result,
-                    "count": len(result),
-                    "site_domain": site_domain,
-                    "torrent_key": torrent_key
-                }
+            lst = self._downloader_torrents_list()
+            return {"success": True, "torrents": lst, "count": len(lst), "site_domain": site_domain, "torrent_key": torrent_key}
         except Exception as e:
             logger.error(f"PT魔力计算器插件：关联种子失败: {e}", exc_info=True)
             return {"success": False, "message": f"关联失败: {str(e)}"}
@@ -1545,3 +1379,26 @@ class PTBonusCalc(_PluginBase):
         except Exception as e:
             logger.error(f"PT魔力计算器插件：取消关联失败: {e}", exc_info=True)
             return {"success": False, "message": f"取消关联失败: {str(e)}"}
+
+    def _api_seed_association_data(self, data: Optional[dict] = Body(None)):
+        """
+        用当前或传入的表单配置计算未匹配种子与每行下拉候选。
+        body 可选：{ "selected_sites": [], "sync_downloaders": [], "site_address_mappings": {} }
+        供前端在未保存时刷新种子关联区域。
+        """
+        try:
+            override = None
+            if data and isinstance(data, dict):
+                override = {}
+                if "selected_sites" in data:
+                    override["selected_sites"] = data["selected_sites"]
+                if "sync_downloaders" in data:
+                    override["sync_downloaders"] = data["sync_downloaders"]
+                if "site_address_mappings" in data and isinstance(data["site_address_mappings"], dict):
+                    override["site_address_mappings"] = data["site_address_mappings"]
+                if not override:
+                    override = None
+            return self._build_seed_association_payload(override)
+        except Exception as e:
+            logger.error(f"PT魔力计算器插件：获取种子关联数据失败: {e}", exc_info=True)
+            return {"total_unmatched_count": 0, "unmatched_by_site": {}}
