@@ -5,6 +5,7 @@ PT 魔力计算器插件：展示主程序中是否有 PT 魔力计算所需的�
 """
 import math
 import re
+import unicodedata
 from datetime import datetime
 from typing import Any, List, Dict, Optional, Tuple
 
@@ -115,6 +116,29 @@ def _parse_list_config(value: Any) -> List[str]:
 def _torrent_key(torrent_id: Any, name: str = "", size: Any = 0) -> str:
     """从 torrent_id / name / size 得到唯一键，用于映射。"""
     return str(torrent_id) if torrent_id else f"{name or ''}|{size or 0}"
+
+
+def _display_width(s: str) -> int:
+    """计算字符串显示宽度，中文/日文=2，英文=1。"""
+    if not s:
+        return 0
+    return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in s)
+
+
+def _truncate_by_display_width(s: str, max_width: int, suffix: str = "...") -> tuple:
+    """
+    按显示宽度截断字符串，兼容中文/日文（全角=2）与英文（半角=1）。
+    返回 (截断后字符串, 是否被截断)。
+    """
+    if not s or max_width <= 0:
+        return (s or "", False)
+    width = 0
+    for i, c in enumerate(s):
+        w = 2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+        if width + w > max_width:
+            return (s[:i] + suffix, True)
+        width += w
+    return (s, False)
 
 
 class PTBonusCalc(_PluginBase):
@@ -251,6 +275,7 @@ class PTBonusCalc(_PluginBase):
             payload = self._build_seed_association_payload(None)
             total_unmatched_count = payload["total_unmatched_count"]
             unmatched_by_site = payload["unmatched_by_site"]
+            sites_with_config_data = set(payload.get("sites_with_config_data", []))
             
             # 下载器地址关键词选项：先从已配置的站点地址映射收集（规范为域名），再在配置了同步下载器时合并 tracker 域名
             address_keyword_options = set()
@@ -330,36 +355,38 @@ class PTBonusCalc(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
-                                "props": {"cols": 12},
+                                "props": {"cols": 12, "md": 4},
                                 "content": [
                                     {
-                                        "component": "VDivider",
-                                        "props": {"class": "my-2"},
-                                    },
-                                    {
-                                        "component": "div",
-                                        "text": "站点地址映射",
-                                        "props": {"class": "text-h6 mb-2"},
-                                    },
-                                    {
-                                        "component": "div",
-                                        "text": "配置站点域名与下载器中的地址关键词映射，用于更准确地匹配种子。下拉选项来自同步数据下载器中种子的 tracker 域名，可多选。",
-                                        "props": {"class": "text-body-2 mb-4 text-grey"},
+                                        "component": "VBtn",
+                                        "props": {
+                                            "block": True,
+                                            "color": "primary",
+                                            "variant": "tonal",
+                                            "onClick": "function(e) { site_mapping_dialog_open = true }",
+                                        },
+                                        "text": "打开站点地址映射与种子关联管理",
                                     },
                                 ],
                             },
                         ],
                     },
-        ]
-        }
+                ]
+            }
         ]
         
         # 下载器地址关键词多选下拉的选项（tracker 域名 + 已配置关键词）
         address_keyword_items = [{"title": d, "value": d} for d in address_keyword_options]
         
-        # 站点地址映射只展示「显示站点」已选的站点；未选则展示全部启用站点
+        # 站点地址映射只展示「显示站点」已选的站点（未选则不展示）；且仅展示有配置数据（有用户数据）的站点
         selected_domain_set = set(self.selected_sites) if self.selected_sites else None
-        sites_for_mapping = [s for s in enabled_sites if s.get("value") and (selected_domain_set is None or s.get("value") in selected_domain_set)]
+        sites_for_mapping = [
+            s for s in enabled_sites
+            if s.get("value")
+            and selected_domain_set is not None
+            and s.get("value") in selected_domain_set
+            and s.get("value") in sites_with_config_data
+        ]
         
         # 为每个站点添加地址映射配置
         site_mapping_rows = []
@@ -368,12 +395,10 @@ class PTBonusCalc(_PluginBase):
             site_title = site.get("title", "")
             if not site_domain:
                 continue
-            
-            # 该站点已配置的地址关键词（用于多选回显）
-            current_keywords = self.site_address_mappings.get(site_domain, [])
-            
+
             site_mapping_rows.append({
                 "component": "VRow",
+                "props": {"class": "mb-3"},
                 "content": [
                     {
                         "component": "VCol",
@@ -407,40 +432,42 @@ class PTBonusCalc(_PluginBase):
                 ],
             })
         
-        if site_mapping_rows:
-            form_items[0]["content"].extend(site_mapping_rows)
-        
-        form_items[0]["content"].extend([
+        # 弹窗内容：站点地址映射 + 种子关联管理
+        dialog_body = [
             {
-                "component": "VRow",
-                "content": [
-                    {
-                        "component": "VCol",
-                        "props": {"cols": 12},
-                        "content": [
-                            {
-                                "component": "VDivider",
-                                "props": {"class": "my-2"},
-                            },
-                            {
-                                "component": "div",
-                                "text": "种子关联管理",
-                                "props": {"class": "text-h6 mb-2"},
-                            },
-                            {
-                                "component": "div",
-                                "text": f"当前有 {total_unmatched_count} 个未匹配的站点种子（分布在 {len(unmatched_by_site)} 个站点）。点击下方站点展开，为每个种子选择对应的下载器种子进行关联。保存配置后关联生效。修改「显示站点」「同步数据下载器」或「站点地址映射」后需先保存再重新打开本设置页，候选列表才会更新。",
-                                "props": {"class": "text-body-2 mb-4 text-grey"},
-                            },
-                        ],
-                    },
-                ],
+                "component": "VDivider",
+                "props": {"class": "my-2"},
+            },
+            {
+                "component": "div",
+                "text": "站点地址映射",
+                "props": {"class": "text-h6 mb-2"},
+            },
+            {
+                "component": "div",
+                "text": "配置站点域名与下载器中的地址关键词映射，用于更准确地匹配种子。下拉选项来自同步数据下载器中种子的 tracker 域名，可多选。",
+                "props": {"class": "text-body-2 mb-4 text-grey"},
+            },
+        ]
+        dialog_body.extend(site_mapping_rows)
+        dialog_body.extend([
+            {
+                "component": "VDivider",
+                "props": {"class": "my-2"},
+            },
+            {
+                "component": "div",
+                "text": "种子关联管理",
+                "props": {"class": "text-h6 mb-2"},
+            },
+            {
+                "component": "div",
+                "text": f"当前有 {total_unmatched_count} 个未匹配的站点种子（分布在 {len(unmatched_by_site)} 个站点）。点击下方站点展开，为每个种子选择对应的下载器种子进行关联。保存配置后关联生效。修改「显示站点」「同步数据下载器」或「站点地址映射」后需先保存再重新打开本设置页，候选列表才会更新。",
+                "props": {"class": "text-body-2 mb-4 text-grey"},
             },
         ])
         
-        # 按站点分组显示未匹配的种子，使用折叠面板（追加到VForm的content中）
-        vform_content = form_items[0]["content"]
-        
+        # 按站点分组显示未匹配的种子，使用折叠面板
         mappings = self._get_torrent_mappings()
         default_data = {}
         # 站点地址映射多选下拉的默认选中值（仅对当前展示的站点）；已保存的 URL 规范为域名，避免与选项重复
@@ -471,23 +498,27 @@ class PTBonusCalc(_PluginBase):
                     "content": [
                         {
                             "component": "VCol",
-                            "props": {"cols": 12, "md": 6},
+                            "props": {"cols": 12, "md": 6, "style": "min-width: 0"},
                             "content": [
                                 {
                                     "component": "div",
-                                    "text": f"{unmatched['name'][:60]}",
-                                    "props": {"class": "text-body-2 mb-1"},
+                                    "text": unmatched["name"] or "—",
+                                    "props": {
+                                        "class": "text-body-2 mb-1",
+                                        "style": "overflow: hidden; text-overflow: ellipsis; white-space: nowrap",
+                                        "title": unmatched["name"] or "",
+                                    },
                                 },
                                 {
                                     "component": "div",
                                     "text": f"大小: {StringUtils.str_filesize(unmatched['size'])}",
-                                    "props": {"class": "text-caption text-grey mb-2"},
+                                    "props": {"class": "text-caption text-grey mb-1"},
                                 },
                             ],
                         },
                         {
                             "component": "VCol",
-                            "props": {"cols": 12, "md": 6},
+                            "props": {"cols": 12, "md": 6, "style": "min-width: 0"},
                             "content": [
                                 {
                                     "component": "VSelect",
@@ -495,9 +526,12 @@ class PTBonusCalc(_PluginBase):
                                         "model": f"torrent_mapping_{site_domain}_{unmatched['torrent_key'].replace('|', '_').replace('/', '_')}",
                                         "label": f"选择下载器种子（已筛选 {len(filtered_downloader_torrents)} 个）",
                                         "items": filtered_downloader_torrents,
+                                        "itemTitle": "display",
+                                        "itemValue": "value",
                                         "clearable": True,
                                         "hint": "已按站点地址映射筛选，可手动选择对应下载器种子",
                                         "density": "compact",
+                                        "style": "min-width: 0; max-width: 100%",
                                     },
                                 },
                             ],
@@ -519,18 +553,25 @@ class PTBonusCalc(_PluginBase):
                 "content": [
                     {
                         "component": "VExpansionPanelTitle",
+                        "props": {"style": "background-color: #e3f2fd; border-left: 4px solid #1976d2"},
                         "text": f"{site_name}（共 {total_count} 个做种，已匹配 {matched_count} 个，{len(site_torrents)} 个未匹配）"
                     },
                     {
                         "component": "VExpansionPanelText",
-                        "content": site_torrent_rows
+                        "content": [
+                            {
+                                "component": "div",
+                                "props": {"style": "max-height: 280px; overflow-y: auto; overflow-x: hidden; padding-top: 12px"},
+                                "content": site_torrent_rows
+                            }
+                        ]
                     }
                 ]
             })
         
-        # 将折叠面板添加到表单中
+        # 将站点种子折叠面板添加到内容
         if site_panels:
-            vform_content.append({
+            dialog_body.append({
                 "component": "VRow",
                 "content": [
                     {
@@ -546,10 +587,48 @@ class PTBonusCalc(_PluginBase):
                     }
                 ]
             })
-        
+
+        # 将 VDialog 追加到表单，弹窗内容为站点地址映射与种子关联管理
+        form_items[0]["content"].append({
+            "component": "VDialog",
+            "props": {
+                "model": "site_mapping_dialog_open",
+                "max-width": "65rem",
+                "overlay-class": "v-overlay--scroll-blocked",
+                "content-class": "v-card v-card--density-default v-card--variant-elevated rounded-t",
+            },
+            "content": [
+                {
+                    "component": "VCard",
+                    "props": {"title": "站点地址映射与种子关联管理"},
+                    "content": [
+                        {
+                            "component": "VDialogCloseBtn",
+                            "props": {"model": "site_mapping_dialog_open"},
+                        },
+                        {
+                            "component": "VCardText",
+                            "props": {},
+                            "content": dialog_body,
+                        },
+                    ],
+                },
+            ],
+        })
+
+        default_data["site_mapping_dialog_open"] = False
+
         return form_items, default_data
 
     def get_page(self) -> List[dict]:
+        if not self.selected_sites:
+            return [
+                {
+                    "component": "div",
+                    "text": "请先在插件配置中勾选「显示站点」，保存后再查看本页。",
+                    "props": {"class": "text-center pa-4"},
+                }
+            ]
         data = self._get_bonus_seeding_data()
         if not data:
             return [
@@ -582,10 +661,10 @@ class PTBonusCalc(_PluginBase):
                 for idx, r in enumerate(torrents, 1):
                     trs.append({
                         "component": "tr",
-                        "props": {"class": "text-sm"},
+                        "props": {"class": "text-sm", "style": "white-space: nowrap"},
                         "content": [
                             {"component": "td", "props": {"class": "text-end"}, "text": str(idx)},
-                            {"component": "td", "props": {"class": "text-start"}, "text": (r["name"] or "—")[:80] + ("..." if len(str(r["name"] or "")) > 80 else "")},
+                            {"component": "td", "props": {"class": "text-start", "style": "max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap", "title": r["name"] or ""}, "text": (r["name"] or "—")[:80] + ("..." if len(str(r["name"] or "")) > 80 else "")},
                             {"component": "td", "props": {"class": "text-end"}, "text": StringUtils.str_filesize(r["size"])},
                             {"component": "td", "props": {"class": "text-end"}, "text": str(r["seeders"])},
                             {"component": "td", "props": {"class": "text-start"}, "text": (r["pubdate"] or "—")},
@@ -599,30 +678,31 @@ class PTBonusCalc(_PluginBase):
                             {"component": "td", "props": {"class": "text-end"}, "text": self._format_seeding_time(r.get("downloader_seeding_time", 0)) if r.get("matched") else "—"},
                         ],
                     })
-                panel_content = [
+                inner_content = [
                     {"component": "div", "text": header, "props": {"class": "text-body-2 mb-2"}},
                     {
                         "component": "VTable",
-                        "props": {"hover": True},
+                        "props": {"hover": True, "style": "table-layout: auto; min-width: max-content"},
                         "content": [
                             {
                                 "component": "thead",
                                 "content": [{
                                     "component": "tr",
+                                    "props": {"style": "white-space: nowrap"},
                                     "content": [
-                                        {"component": "th", "props": {"class": "text-end"}, "text": "序号"},
-                                        {"component": "th", "props": {"class": "text-start ps-4"}, "text": "种子名"},
-                                        {"component": "th", "props": {"class": "text-end"}, "text": "大小"},
-                                        {"component": "th", "props": {"class": "text-end"}, "text": "做种人数"},
-                                        {"component": "th", "props": {"class": "text-start"}, "text": "发布时间"},
-                                        {"component": "th", "props": {"class": "text-end"}, "text": "T(周)"},
-                                        {"component": "th", "props": {"class": "text-end"}, "text": "A值"},
-                                        {"component": "th", "props": {"class": "text-end"}, "text": "A/GB"},
-                                        {"component": "th", "props": {"class": "text-end"}, "text": "每小时魔力"},
-                                        {"component": "th", "props": {"class": "text-end"}, "text": "关联状态"},
-                                        {"component": "th", "props": {"class": "text-end"}, "text": "分享率"},
-                                        {"component": "th", "props": {"class": "text-end"}, "text": "上传量"},
-                                        {"component": "th", "props": {"class": "text-end"}, "text": "做种时长"},
+                                        {"component": "th", "props": {"class": "text-end", "style": "white-space: nowrap"}, "text": "序号"},
+                                        {"component": "th", "props": {"class": "text-start ps-4", "style": "white-space: nowrap; max-width: 220px; overflow: hidden; text-overflow: ellipsis"}, "text": "种子名"},
+                                        {"component": "th", "props": {"class": "text-end", "style": "white-space: nowrap"}, "text": "大小"},
+                                        {"component": "th", "props": {"class": "text-end", "style": "white-space: nowrap"}, "text": "做种人数"},
+                                        {"component": "th", "props": {"class": "text-start", "style": "white-space: nowrap"}, "text": "发布时间"},
+                                        {"component": "th", "props": {"class": "text-end", "style": "white-space: nowrap"}, "text": "T(周)"},
+                                        {"component": "th", "props": {"class": "text-end", "style": "white-space: nowrap"}, "text": "A值"},
+                                        {"component": "th", "props": {"class": "text-end", "style": "white-space: nowrap"}, "text": "A/GB"},
+                                        {"component": "th", "props": {"class": "text-end", "style": "white-space: nowrap"}, "text": "每小时魔力"},
+                                        {"component": "th", "props": {"class": "text-end", "style": "white-space: nowrap"}, "text": "关联状态"},
+                                        {"component": "th", "props": {"class": "text-end", "style": "white-space: nowrap"}, "text": "分享率"},
+                                        {"component": "th", "props": {"class": "text-end", "style": "white-space: nowrap"}, "text": "上传量"},
+                                        {"component": "th", "props": {"class": "text-end", "style": "white-space: nowrap"}, "text": "做种时长"},
                                     ],
                                 }],
                             },
@@ -630,11 +710,22 @@ class PTBonusCalc(_PluginBase):
                         ],
                     },
                 ]
+                panel_content = [
+                    {
+                        "component": "div",
+                        "props": {"style": "max-height: 420px; overflow-y: auto; overflow-x: auto; padding-top: 12px"},
+                        "content": inner_content
+                    }
+                ]
             title_text = f"{site_name}（{len(torrents) if torrents else 0} 个做种，时魔 {total_bonus_fmt}）"
             panels.append({
                 "component": "VExpansionPanel",
                 "content": [
-                    {"component": "VExpansionPanelTitle", "text": title_text},
+                    {
+                        "component": "VExpansionPanelTitle",
+                        "props": {"style": "background-color: #e3f2fd; border-left: 4px solid #1976d2"},
+                        "text": title_text
+                    },
                     {"component": "VExpansionPanelText", "content": panel_content},
                 ],
             })
@@ -773,11 +864,10 @@ class PTBonusCalc(_PluginBase):
                     bonus_per_hour, A_value, A_per_GB = _calc_bonus_per_hour(T_weeks, S_GB, N, T0, N0, B0, L, weight)
                 else:
                     bonus_per_hour, A_value, A_per_GB = 0.0, 0.0, 0.0
-                # 匹配下载器种子
+                # 匹配下载器种子：仅当站点配置了站点地址映射时才做匹配
                 matched_hash = None
                 downloader_data = None
-                if downloader_torrents:
-                    # 配置了站点地址映射则从按 tracker 分组的 map 中取该站对应数组，再名称+大小匹配
+                if downloader_torrents and self.site_address_mappings.get(domain_key):
                     candidate_torrents = self._get_candidate_torrents_for_site(
                         domain_key, downloader_torrents, torrents_by_domain
                     )
@@ -1140,6 +1230,17 @@ class PTBonusCalc(_PluginBase):
                         total_unmatched_count -= len(unmatched_by_site[domain]["torrents"])
                         del unmatched_by_site[domain]
 
+            # 种子关联管理只展示「显示站点」已选的站点（未选则不展示）
+            if self.selected_sites:
+                selected_domain_set = set(self.selected_sites)
+                for domain in list(unmatched_by_site.keys()):
+                    if domain not in selected_domain_set:
+                        total_unmatched_count -= len(unmatched_by_site[domain]["torrents"])
+                        del unmatched_by_site[domain]
+            else:
+                total_unmatched_count = 0
+                unmatched_by_site.clear()
+
             downloader_torrents_dict = {}
             if self.sync_downloaders:
                 try:
@@ -1147,9 +1248,13 @@ class PTBonusCalc(_PluginBase):
                 except Exception as e:
                     logger.error(f"PT魔力计算器插件：_build_seed_association_payload 获取下载器种子失败: {e}", exc_info=True)
 
-            # 为每个站点、每个未匹配种子计算下拉候选（含按域名放宽的站点池）
+            # 为每个站点、每个未匹配种子计算下拉候选（含按域名放宽的站点池）；未配置站点地址映射则不提供候选
             for site_domain, site_data in unmatched_by_site.items():
                 site_keywords = self.site_address_mappings.get(site_domain, [])
+                if not site_keywords:
+                    for unmatched in site_data["torrents"]:
+                        unmatched["options"] = []
+                    continue
                 match_terms = set()
                 for kw in site_keywords:
                     k = (kw or "").strip()
@@ -1176,15 +1281,29 @@ class PTBonusCalc(_PluginBase):
                     site_filtered_dict = downloader_torrents_dict
 
                 # 按映射地址筛出的总条数；未匹配的站点种子其下拉中展示该站点下全部（地址已筛）下载器种子，由用户手动选
-                site_filtered_list = [
-                    {"title": f"{dl_torrent.get('name', '')[:70]} ({StringUtils.str_filesize(dl_torrent.get('total_size', 0))})", "value": hash_value}
-                    for hash_value, dl_torrent in site_filtered_dict.items()
-                ]
-                site_filtered_list.sort(key=lambda x: x["title"])
+                # 显示：按显示宽度截断的名称 + 大小，总宽度包含大小；title 存全称供 HTML title 悬停展示
+                _MAX_TOTAL_WIDTH = 48
+                site_filtered_list = []
+                for hash_value, dl_torrent in site_filtered_dict.items():
+                    name = dl_torrent.get("name") or ""
+                    size_str = StringUtils.str_filesize(dl_torrent.get("total_size", 0))
+                    suffix = f" ({size_str})"
+                    max_name_width = _MAX_TOTAL_WIDTH - _display_width(suffix)
+                    short_name, _ = _truncate_by_display_width(name, max_name_width)
+                    display = short_name + suffix
+                    item = {"display": display, "value": hash_value, "title": name}
+                    site_filtered_list.append(item)
+                site_filtered_list.sort(key=lambda x: x["display"])
                 for unmatched in site_data["torrents"]:
                     unmatched["options"] = site_filtered_list
 
-            return {"total_unmatched_count": total_unmatched_count, "unmatched_by_site": unmatched_by_site}
+            # 有配置数据的站点（有用户数据的站点），用于站点地址映射和种子关联管理仅展示这些站点
+            sites_with_config_data = [block["domain"] for block in unmatched_torrents_data]
+            return {
+                "total_unmatched_count": total_unmatched_count,
+                "unmatched_by_site": unmatched_by_site,
+                "sites_with_config_data": sites_with_config_data,
+            }
         finally:
             self.selected_sites = backup["selected_sites"]
             self.sync_downloaders = backup["sync_downloaders"]
