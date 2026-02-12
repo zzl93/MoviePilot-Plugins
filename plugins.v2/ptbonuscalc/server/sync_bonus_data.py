@@ -13,8 +13,8 @@ from app.log import logger
 from app.utils.http import RequestUtils
 from app.utils.string import StringUtils
 
-from app.plugins.ptbonuscalc.lib import seedinfo_oper
-from app.plugins.ptbonuscalc.lib.page_parser import (
+from app.plugins.ptbonuscalc.server import seedinfo_oper
+from app.plugins.ptbonuscalc.server.page_parser import (
     parse_bonus_params_nexusphp,
     parse_torrent_activity_nexusphp,
     extract_userid_from_index_nexusphp,

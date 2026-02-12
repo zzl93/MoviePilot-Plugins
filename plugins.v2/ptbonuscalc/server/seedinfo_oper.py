@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from app.db import Engine, Base, ScopedSession, db_query, db_update
 from app.log import logger
 
-from app.plugins.ptbonuscalc.models import SeedInfo, SeedInfoSnapshot
+from app.plugins.ptbonuscalc.server.models import SeedInfo, SeedInfoSnapshot
 
 
 def init_seedinfo_db() -> None:
@@ -92,10 +92,10 @@ def save_seed_info(
 ) -> None:
     """
     保存或更新种子主表，并写入当日快照。
-    site_data: name, size, pubdate
-    downloader_data: hash, tracker, added_on(秒时间戳), ratio, uploaded, downloaded, seeding_time, state, save_path, category, tags
+    site_data: name, size, pubdate, seed_attr(主辅属性 main/aux)
+    downloader_data: hash, tracker, added_on(秒时间戳), downloader(名称), ratio, uploaded, downloaded, seeding_time, state, save_path, category, tags
     """
-    from app.plugins.ptbonuscalc.lib.tracker_utils import parse_tracker_domain
+    from app.plugins.ptbonuscalc.server.tracker_utils import parse_tracker_domain
 
     mk = _mapping_key(site_domain, torrent_key)
     today = date.today()
@@ -119,6 +119,8 @@ def save_seed_info(
     row.name = site_data.get("name") or row.name
     row.size = site_data.get("size", 0) or row.size or 0
     row.pubdate = site_data.get("pubdate") or row.pubdate
+    if "seed_attr" in site_data:
+        row.seed_attr = site_data.get("seed_attr") or None
 
     if downloader_data:
         tracker_raw = downloader_data.get("tracker") or downloader_data.get("downloader_tracker") or ""
@@ -129,6 +131,17 @@ def save_seed_info(
         row.downloader_tracker = tracker_raw or row.downloader_tracker
         row.downloader_tracker_domain = tracker_domain or row.downloader_tracker_domain
         row.downloader_added_at = added_dt or row.downloader_added_at
+        # 主从表共有字段：仅当新值与主表当前值不同时才更新主表，否则只更新快照表
+        new_name = downloader_data.get("downloader") or downloader_data.get("downloader_name")
+        new_category = downloader_data.get("category") or downloader_data.get("downloader_category")
+        tags_val = downloader_data.get("tags") or downloader_data.get("downloader_tags")
+        new_tags = tags_val if isinstance(tags_val, str) else (",".join(tags_val) if isinstance(tags_val, (list, tuple)) else None)
+        if new_name is not None and new_name != row.downloader_name:
+            row.downloader_name = new_name
+        if new_category is not None and new_category != row.downloader_category:
+            row.downloader_category = new_category
+        if new_tags is not None and new_tags != row.downloader_tags:
+            row.downloader_tags = new_tags
 
     # 当日快照
     snap = db.query(SeedInfoSnapshot).filter(
@@ -164,9 +177,12 @@ def save_seed_info(
         snap.downloader_seeding_time = downloader_data.get("seeding_time") or downloader_data.get("downloader_seeding_time")
         snap.downloader_state = downloader_data.get("state") or downloader_data.get("downloader_state")
         snap.downloader_save_path = downloader_data.get("save_path") or downloader_data.get("downloader_save_path")
-        snap.downloader_category = downloader_data.get("category") or downloader_data.get("downloader_category")
-        tags_val = downloader_data.get("tags") or downloader_data.get("downloader_tags")
-        snap.downloader_tags = tags_val if isinstance(tags_val, str) else (",".join(tags_val) if isinstance(tags_val, (list, tuple)) else None)
+        if new_name is not None:
+            snap.downloader_name = new_name
+        if new_category is not None:
+            snap.downloader_category = new_category
+        if new_tags is not None:
+            snap.downloader_tags = new_tags
 
 
 @db_update
@@ -273,9 +289,12 @@ def batch_save_seeding_from_parser(
                 name=name,
                 size=size_b,
                 pubdate=s.get("pubdate"),
+                seed_attr=s.get("seed_attr") or None,
             )
             db.add(row)
             db.flush()
+        elif "seed_attr" in s:
+            row.seed_attr = s.get("seed_attr") or None
 
         snap = db.query(SeedInfoSnapshot).filter(
             SeedInfoSnapshot.seedinfo_id == row.id,

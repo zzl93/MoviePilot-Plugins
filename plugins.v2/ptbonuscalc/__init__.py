@@ -21,8 +21,8 @@ from app.schemas.types import DownloaderType, EventType
 from app.helper.service import ServiceConfigHelper
 from app.log import logger
 
-from app.plugins.ptbonuscalc.lib import seedinfo_oper
-from app.plugins.ptbonuscalc.lib.sync_bonus_data import sync_from_fetch, sync_from_siteuserdata
+from app.plugins.ptbonuscalc.server import seedinfo_oper
+from app.plugins.ptbonuscalc.server.sync_bonus_data import sync_from_fetch, sync_from_siteuserdata
 
 
 def _parse_pubdate_weeks(pubdate: Optional[str]) -> Optional[float]:
@@ -160,8 +160,13 @@ class PTBonusCalc(_PluginBase):
             self.site_oper = SiteOper()
             self.sites_helper = SitesHelper()
             self.eventmanager.add_event_listener(EventType.SiteRefreshed, self._on_site_refreshed)
-            self.sync_downloaders = _parse_list_config(config.get("sync_downloaders"))
-            logger.info(f"PT魔力计算器插件初始化：同步数据下载器配置 = {self.sync_downloaders} config={config}")
+            primary = _parse_list_config(config.get("primary_downloaders"))
+            aux = _parse_list_config(config.get("aux_downloaders"))
+            if primary or aux:
+                self.sync_downloaders = list(dict.fromkeys(primary + aux))
+            else:
+                self.sync_downloaders = _parse_list_config(config.get("sync_downloaders"))
+            logger.info(f"PT魔力计算器插件初始化：主下载器={primary} 辅下载器={aux} 同步下载器={self.sync_downloaders}")
             self.selected_sites = _parse_list_config(config.get("selected_sites"))
             logger.info(f"PT魔力计算器插件初始化：站点选择配置 = {self.selected_sites}")
 
@@ -322,15 +327,34 @@ class PTBonusCalc(_PluginBase):
             address_keyword_options = sorted(address_keyword_options)
             logger.info(f"PT魔力计算器[form_options] address_keyword_options={list(address_keyword_options)[:20]}")
 
+            suggested_site_mappings = {}
+            addr_list = list(address_keyword_options)
+            for site in enabled_sites:
+                site_domain = (site.get("value") or "").strip().lower()
+                if not site_domain:
+                    continue
+                matches = []
+                for addr in addr_list:
+                    addr_lower = addr.lower()
+                    if site_domain == addr_lower:
+                        matches.append(addr)
+                    elif addr_lower.endswith("." + site_domain):
+                        matches.append(addr)
+                    elif site_domain.endswith("." + addr_lower):
+                        matches.append(addr)
+                if matches:
+                    suggested_site_mappings[site_domain] = matches
+
             return {
                 "sites": enabled_sites,
                 "downloaders": qb_downloaders,
                 "address_keyword_options": [{"title": d, "value": d} for d in address_keyword_options],
                 "sites_with_config_data": sites_with_config_data,
+                "suggested_site_mappings": suggested_site_mappings,
             }
         except Exception as e:
             logger.error(f"PT魔力计算器插件：form_options 失败: {e}", exc_info=True)
-            return {"sites": [], "downloaders": [], "address_keyword_options": [], "sites_with_config_data": []}
+            return {"sites": [], "downloaders": [], "address_keyword_options": [], "sites_with_config_data": [], "suggested_site_mappings": {}}
 
     def _on_site_refreshed(self, event: Any) -> None:
         """站点刷新后，拉取页面解析并同步 torrent_activity、bonus_params 到插件存储"""
@@ -364,7 +388,9 @@ class PTBonusCalc(_PluginBase):
                     return [indexer]
             return []
         all_sites = [s for s in (self.sites_helper.get_indexers() or []) if s.get("is_active")]
-        if filter_by_selected_sites and self.selected_sites:
+        if filter_by_selected_sites:
+            if not self.selected_sites:
+                return []
             selected_domains = set(self.selected_sites)
             return [s for s in all_sites if StringUtils.get_url_domain(s.get("domain") or "") in selected_domains]
         return all_sites
@@ -546,6 +572,10 @@ class PTBonusCalc(_PluginBase):
                 override["selected_sites"] = data["selected_sites"]
             if "sync_downloaders" in data:
                 override["sync_downloaders"] = data["sync_downloaders"]
+            if "primary_downloaders" in data or "aux_downloaders" in data:
+                prim = _parse_list_config(data.get("primary_downloaders"))
+                aux = _parse_list_config(data.get("aux_downloaders"))
+                override["sync_downloaders"] = list(dict.fromkeys(prim + aux))
             if "site_address_mappings" in data and isinstance(data["site_address_mappings"], dict):
                 override["site_address_mappings"] = data["site_address_mappings"]
             payload = self._build_seed_association_payload(
@@ -714,6 +744,10 @@ class PTBonusCalc(_PluginBase):
                     self.selected_sites = _parse_list_config(override_config["selected_sites"])
                 if "sync_downloaders" in override_config:
                     self.sync_downloaders = _parse_list_config(override_config["sync_downloaders"])
+                elif "primary_downloaders" in override_config or "aux_downloaders" in override_config:
+                    prim = _parse_list_config(override_config.get("primary_downloaders"))
+                    aux = _parse_list_config(override_config.get("aux_downloaders"))
+                    self.sync_downloaders = list(dict.fromkeys(prim + aux))
                 if "site_address_mappings" in override_config and isinstance(override_config["site_address_mappings"], dict):
                     self.site_address_mappings = {k: (v if isinstance(v, list) else [str(v)]) for k, v in override_config["site_address_mappings"].items()}
 
