@@ -57,41 +57,6 @@ def _fetch_page(
         settings.ENCODING_DETECTION_MIN_CONFIDENCE,
     ) or ""
 
-
-def sync_from_siteuserdata(domain_key: str, plugin_instance: Any) -> bool:
-    """
-    从 siteuserdata 读取 torrent_activity 和 bonus_params，写入插件存储。
-    主项目刷新站点后调用（如 SiteRefreshed 事件）。
-    :param domain_key: 站点域名
-    :param plugin_instance: 插件实例，用于 save_data
-    :return: 是否成功
-    """
-    try:
-        site_oper = SiteOper()
-        userdata_list = site_oper.get_userdata_by_domain(domain_key)
-        if not userdata_list:
-            return False
-        userdata_list = sorted(
-            userdata_list,
-            key=lambda u: (u.updated_day or "", u.updated_time or ""),
-            reverse=True,
-        )
-        userdata = userdata_list[0]
-        activity = getattr(userdata, "torrent_activity", None) or {}
-        seeding = activity.get("seeding") if isinstance(activity, dict) else []
-        if not isinstance(seeding, list):
-            seeding = []
-        bonus_params = getattr(userdata, "bonus_params", None) or {}
-        if not isinstance(bonus_params, dict):
-            bonus_params = {}
-        seedinfo_oper.batch_save_seeding_from_parser(None, domain_key, seeding)
-        plugin_instance.save_data(f"bonus_params_{domain_key}", bonus_params)
-        return True
-    except Exception as e:
-        logger.warning(f"PT魔力计算器插件：从 siteuserdata 同步失败 {domain_key}: {e}")
-        return False
-
-
 def sync_from_fetch(
     site: dict,
     plugin_instance: Any,

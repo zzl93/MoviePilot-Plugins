@@ -3,6 +3,9 @@ import vue from '@vitejs/plugin-vue'
 import federation from '@originjs/vite-plugin-federation'
 
 export default defineConfig({
+  define: {
+    __APP_VERSION__: JSON.stringify(process.env.APP_VERSION || process.env.npm_package_version || '0.0.0'),
+  },
   plugins: [
     vue(),
     federation({

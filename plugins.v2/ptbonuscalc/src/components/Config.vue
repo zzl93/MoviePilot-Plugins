@@ -71,7 +71,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, watch } from 'vue'
+import { ref, computed, onMounted, onActivated, watch } from 'vue'
 
 const props = defineProps<{
   initialConfig?: Record<string, unknown>
@@ -151,6 +151,34 @@ watch(
   { deep: true }
 )
 
+async function fetchDownloaderTrackerOptions() {
+  const selected = (form.value.selected_sites as string[]) || []
+  const primary = (form.value.primary_downloaders as string[]) || []
+  const aux = (form.value.aux_downloaders as string[]) || []
+  const hasSites = selected.length > 0
+  const hasDownloaders = primary.length > 0 || aux.length > 0
+  if (!hasSites || !hasDownloaders || !props.api?.post) return
+  try {
+    const res = (await props.api.post(`${API}/downloader_tracker_options`, {
+      primary_downloaders: primary,
+      aux_downloaders: aux,
+    })) as { address_keyword_options?: { title: string; value: string }[] }
+    formOptions.value.address_keyword_options = res?.address_keyword_options || []
+  } catch (e) {
+    console.error('fetchDownloaderTrackerOptions', e)
+  }
+}
+
+watch(
+  () => [
+    (form.value.selected_sites as string[])?.length,
+    (form.value.primary_downloaders as string[])?.length,
+    (form.value.aux_downloaders as string[])?.length,
+  ],
+  () => { fetchDownloaderTrackerOptions() },
+  { deep: true }
+)
+
 function getSiteMapping(domain: string): string[] {
   const v = form.value['site_address_mapping_' + domain]
   if (Array.isArray(v) && v.length) return [...v]
@@ -194,6 +222,11 @@ function save() {
   setTimeout(() => { saving.value = false }, 500)
 }
 
+async function loadFormOptions() {
+  await fetchFormOptions()
+  await fetchDownloaderTrackerOptions()
+}
+
 onMounted(async () => {
   const init = props.initialConfig || {}
   const legacySync = Array.isArray(init.sync_downloaders) ? init.sync_downloaders as string[] : []
@@ -207,7 +240,7 @@ onMounted(async () => {
       form.value[k] = v
     }
   }
-  await fetchFormOptions()
+  await loadFormOptions()
   const suggested = formOptions.value.suggested_site_mappings || {}
   for (const site of formOptions.value.sites) {
     const domain = site.value
@@ -217,6 +250,10 @@ onMounted(async () => {
       form.value['site_address_mapping_' + domain] = [...s]
     }
   }
+})
+
+onActivated(() => {
+  loadFormOptions()
 })
 </script>
 

@@ -4,137 +4,23 @@ PT 魔力计算器插件（Vue模式）：展示主程序中是否有 PT 魔力�
 提供 form_options、test_main_data、做种魔力列表 API 等，配置页与详情页由 Vue 组件渲染。
 """
 import math
+import random
 import re
-import unicodedata
-from datetime import datetime
 from typing import Any, List, Dict, Optional, Tuple
 
 from fastapi import Query, Body
 from app.chain.site import SiteChain
-from app.helper.module import ModuleHelper
 from app.helper.sites import SitesHelper
+from app.db import SessionFactory
 from app.db.site_oper import SiteOper
 from app.utils.string import StringUtils
 from app.plugins import _PluginBase
-from app.core.module import ModuleManager
-from app.schemas.types import DownloaderType, EventType
+from app.schemas.types import EventType
 from app.helper.service import ServiceConfigHelper
 from app.log import logger
 
-from app.plugins.ptbonuscalc.server import seedinfo_oper
-from app.plugins.ptbonuscalc.server.sync_bonus_data import sync_from_fetch, sync_from_siteuserdata
-
-
-def _parse_pubdate_weeks(pubdate: Optional[str]) -> Optional[float]:
-    """解析发布时间字符串，返回距今周数；解析失败返回 None。"""
-    if not pubdate or not isinstance(pubdate, str):
-        return None
-    s = pubdate.strip().replace("<br/>", " ").replace("<br />", " ").replace("<br>", " ").replace("/", "-").replace("T", " ").rstrip("Z").strip()
-    fmts = [
-        ("%Y-%m-%d %H:%M:%S", 19),
-        ("%Y-%m-%d %H:%M", 16),
-        ("%Y-%m-%d", 10),
-    ]
-    for fmt, length in fmts:
-        try:
-            dt = datetime.strptime(s[:length], fmt)
-            delta = datetime.now() - dt
-            return max(0.0, delta.total_seconds() / (86400 * 7))
-        except ValueError:
-            continue
-    return None
-
-
-def _calc_bonus_per_hour(T_weeks: float, S_GB: float, N: int, T0: int, N0: int, B0: int, L: int, weight: float = 1.0) -> tuple:
-    """NexusPHP 魔力公式。返回 (B 每小时魔力, A 值, A/GB)。"""
-    if T0 <= 0 or N0 <= 0 or B0 <= 0 or L <= 0:
-        return 0.0, 0.0, 0.0
-    c1 = 1.0 - math.pow(10, -T_weeks / T0)
-    n = max(1, N)
-    c2 = 1.0 + math.sqrt(2) * math.pow(10, -(n - 1) / (N0 - 1))
-    A = c1 * S_GB * c2 * weight
-    B = B0 * (2.0 / math.pi) * math.atan(A / L)
-    ave = round(A / S_GB, 2) if S_GB > 0 else 0.0
-    return round(B, 4), round(A, 2), ave
-
-
-_PARSER_CLASSES_CACHE: Optional[List[Any]] = None
-
-
-def _get_parser_parse_info(schema_value: str) -> Dict[str, Any]:
-    """根据 schema 获取 parser 的解析网页信息。"""
-    global _PARSER_CLASSES_CACHE
-    if not schema_value:
-        return {}
-    try:
-        if _PARSER_CLASSES_CACHE is None:
-            _PARSER_CLASSES_CACHE = ModuleHelper.load(
-                "app.modules.indexer.parser",
-                filter_func=lambda _, obj: hasattr(obj, "schema") and getattr(obj, "schema") is not None,
-            )
-        for parser_cls in _PARSER_CLASSES_CACHE or []:
-            if not hasattr(parser_cls, "schema") or parser_cls.schema is None:
-                continue
-            if getattr(parser_cls.schema, "value", None) == schema_value:
-                try:
-                    parser = parser_cls(
-                        site_name="",
-                        url="https://example.com",
-                        site_cookie="",
-                        apikey="",
-                        token="",
-                    )
-                    parse_pages = {
-                        "user_detail": getattr(parser, "_user_detail_page", None),
-                        "user_traffic": getattr(parser, "_user_traffic_page", None),
-                        "torrent_seeding": getattr(parser, "_torrent_seeding_page", None),
-                        "user_basic": getattr(parser, "_user_basic_page", None),
-                        "mail_unread": getattr(parser, "_user_mail_unread_page", None),
-                    }
-                    parse_pages = {k: v for k, v in parse_pages.items() if v}
-                    return {
-                        "parse_pages": parse_pages,
-                        "extracts": ["username", "userid", "upload", "download", "ratio", "bonus", "seeding", "leeching", "seeding_info", "message_unread"],
-                    }
-                except Exception:
-                    return {"error": "parser init failed"}
-        return {}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-def _parse_list_config(value: Any) -> List[str]:
-    """配置项解析：支持 list 或逗号分隔字符串。"""
-    if isinstance(value, list):
-        return [str(x).strip() for x in value if x]
-    if isinstance(value, str):
-        return [x.strip() for x in value.split(",") if x.strip()]
-    return []
-
-
-def _torrent_key(torrent_id: Any, name: str = "", size: Any = 0) -> str:
-    """从 torrent_id / name / size 得到唯一键。"""
-    return str(torrent_id) if torrent_id else f"{name or ''}|{size or 0}"
-
-
-def _display_width(s: str) -> int:
-    """计算字符串显示宽度，中文/日文=2，英文=1。"""
-    if not s:
-        return 0
-    return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in s)
-
-
-def _truncate_by_display_width(s: str, max_width: int, suffix: str = "...") -> tuple:
-    """按显示宽度截断字符串。返回 (截断后字符串, 是否被截断)。"""
-    if not s or max_width <= 0:
-        return (s or "", False)
-    width = 0
-    for i, c in enumerate(s):
-        w = 2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
-        if width + w > max_width:
-            return (s[:i] + suffix, True)
-        width += w
-    return (s, False)
+from app.plugins.ptbonuscalc.server import seedinfo_oper, utils, downloader_fetcher
+from app.plugins.ptbonuscalc.server.sync_bonus_data import sync_from_fetch
 
 
 class PTBonusCalc(_PluginBase):
@@ -150,6 +36,8 @@ class PTBonusCalc(_PluginBase):
     site_oper = None
     sites_helper = None
     sync_downloaders = []
+    primary_downloaders: List[str] = []
+    aux_downloaders: List[str] = []
     selected_sites = []
     site_address_mappings = {}
 
@@ -160,26 +48,45 @@ class PTBonusCalc(_PluginBase):
             self.site_oper = SiteOper()
             self.sites_helper = SitesHelper()
             self.eventmanager.add_event_listener(EventType.SiteRefreshed, self._on_site_refreshed)
-            primary = _parse_list_config(config.get("primary_downloaders"))
-            aux = _parse_list_config(config.get("aux_downloaders"))
+            primary = utils.parse_list_config(config.get("primary_downloaders"))
+            aux = utils.parse_list_config(config.get("aux_downloaders"))
+            self.primary_downloaders = primary
+            self.aux_downloaders = aux
             if primary or aux:
                 self.sync_downloaders = list(dict.fromkeys(primary + aux))
             else:
-                self.sync_downloaders = _parse_list_config(config.get("sync_downloaders"))
+                self.sync_downloaders = utils.parse_list_config(config.get("sync_downloaders"))
             logger.info(f"PT魔力计算器插件初始化：主下载器={primary} 辅下载器={aux} 同步下载器={self.sync_downloaders}")
-            self.selected_sites = _parse_list_config(config.get("selected_sites"))
+            self.selected_sites = utils.parse_list_config(config.get("selected_sites"))
             logger.info(f"PT魔力计算器插件初始化：站点选择配置 = {self.selected_sites}")
 
             site_address_mappings_new = {}
             for key, value in config.items():
                 if key.startswith("site_address_mapping_") and value:
                     site_domain = key.replace("site_address_mapping_", "")
-                    keywords = _parse_list_config(value)
+                    keywords = utils.parse_list_config(value)
                     if keywords:
                         site_address_mappings_new[site_domain] = keywords
                         logger.info(f"PT魔力计算器[init_plugin] 保存配置 key={key} value={value} -> site_domain={site_domain} keywords={keywords}")
             if site_address_mappings_new != self.site_address_mappings:
                 self.site_address_mappings = site_address_mappings_new
+
+            for domain in self.selected_sites or []:
+                if not domain:
+                    continue
+                indexer = self.sites_helper.get_indexer(domain) if self.sites_helper else None
+                if indexer and indexer.get("schema") == "NexusPhp":
+                    site_info = {
+                        "name": indexer.get("name") or domain,
+                        "domain": StringUtils.get_url_domain(indexer.get("domain") or "") or domain,
+                        "url": indexer.get("url") or indexer.get("domain") or "",
+                        "cookie": indexer.get("cookie") or "",
+                        "schema": indexer.get("schema") or "NexusPhp",
+                        "ua": indexer.get("ua") or "",
+                        "proxy": indexer.get("proxy"),
+                    }
+                    if site_info.get("url"):
+                        self.save_data(f"site_info_{domain}", site_info)
 
             mappings = self._get_torrent_mappings()
             auto_mappings = {}
@@ -191,7 +98,7 @@ class PTBonusCalc(_PluginBase):
                     for row in site_block.get("torrents", []):
                         if not row.get("downloader_hash"):
                             continue
-                        torrent_key = _torrent_key(row.get("torrent_id"), row.get("name") or "", row.get("size", 0))
+                        torrent_key = utils.torrent_key(row.get("torrent_id"), row.get("name") or "", row.get("size", 0))
                         if not torrent_key:
                             continue
                         auto_mappings[f"{domain}|{torrent_key}"] = row["downloader_hash"]
@@ -232,7 +139,7 @@ class PTBonusCalc(_PluginBase):
                         continue
                     all_matched = True
                     for row in torrents:
-                        torrent_key = _torrent_key(row.get("torrent_id"), row.get("name") or "", row.get("size", 0))
+                        torrent_key = utils.torrent_key(row.get("torrent_id"), row.get("name") or "", row.get("size", 0))
                         if not torrent_key or f"{domain}|{torrent_key}" not in mappings:
                             all_matched = False
                             break
@@ -269,13 +176,14 @@ class PTBonusCalc(_PluginBase):
     def get_api(self) -> List[Dict[str, Any]]:
         api_specs = [
             ("/form_options", self._api_form_options, "GET", "表单选项", "Vue Config 用：sites、downloaders、address_keyword_options"),
+            ("/downloader_tracker_options", self._api_downloader_tracker_options, "POST", "下载器 Tracker 地址选项", "根据传入的下载器列表返回站点地址映射下拉所需的 Tracker 地址列表"),
             ("/bonus_data", self._api_bonus_data, "POST", "做种与关联数据", "做种魔力列表、未匹配种子、关联数据、下载器种子列表"),
             ("/save_data", self._api_save_data, "POST", "保存数据", "根据前端传入的关联数据批量保存/删除"),
         ]
         return [{"path": p, "endpoint": e, "methods": [m], "auth": "bear", "summary": s, "description": d} for p, e, m, s, d in api_specs]
 
     def _api_form_options(self) -> Dict[str, Any]:
-        """Vue Config 表单选项：sites、downloaders、address_keyword_options、sites_with_config_data。"""
+        """Vue Config 表单选项：sites、downloaders 从主项目站点表/下载器配置实时获取。"""
         try:
             logger.info(f"PT魔力计算器[form_options] 开始")
             if not self.sites_helper:
@@ -284,14 +192,18 @@ class PTBonusCalc(_PluginBase):
             qb_downloaders = [
                 {"title": conf.name, "value": conf.name}
                 for conf in downloader_configs
-                if conf.type == "qbittorrent" and conf.enabled
+                if (conf.type or "").lower() == "qbittorrent" and conf.enabled
             ]
-            all_sites = self.sites_helper.get_indexers() or []
-            enabled_sites = [
-                {"title": f"{site.get('name') or ''} ({StringUtils.get_url_domain(site.get('domain') or '')})", "value": StringUtils.get_url_domain(site.get("domain") or "")}
-                for site in all_sites
-                if site.get("is_active") and site.get("domain")
-            ]
+            db = SessionFactory()
+            try:
+                site_list = SiteOper(db).list_order_by_pri()
+                enabled_sites = [
+                    {"title": f"{s.name or ''} ({StringUtils.get_url_domain(s.domain or '')})", "value": StringUtils.get_url_domain(s.domain or "")}
+                    for s in site_list
+                    if s.is_active and s.domain
+                ]
+            finally:
+                db.close()
             payload = self._build_seed_association_payload(None)
             sites_with_config_data = list(payload.get("sites_with_config_data", []))
 
@@ -301,29 +213,9 @@ class PTBonusCalc(_PluginBase):
                 for kw in keywords:
                     if not kw:
                         continue
-                    d = self._keyword_to_domain(kw)
+                    d = utils.keyword_to_domain(kw)
                     if d:
                         address_keyword_options.add(d)
-            if self.sync_downloaders:
-                try:
-                    downloader_torrents = self._fetch_downloader_torrents()
-                    sample_count = 0
-                    empty_tracker_count = 0
-                    for torrent in downloader_torrents.values():
-                        tracker = torrent.get("tracker") or ""
-                        if not tracker:
-                            empty_tracker_count += 1
-                            continue
-                        domain = self._tracker_full_host(tracker)
-                        if domain:
-                            address_keyword_options.add(domain)
-                        if sample_count < 5:
-                            logger.info(f"PT魔力计算器[form_options] 原始tracker={tracker[:90]}... -> _tracker_full_host={domain}")
-                            sample_count += 1
-                    if empty_tracker_count > 0:
-                        logger.info(f"PT魔力计算器[form_options] 共{len(downloader_torrents)}个种子，其中{empty_tracker_count}个无tracker字段")
-                except Exception as e:
-                    logger.warning(f"PT魔力计算器插件：获取 tracker 域名失败: {e}")
             address_keyword_options = sorted(address_keyword_options)
             logger.info(f"PT魔力计算器[form_options] address_keyword_options={list(address_keyword_options)[:20]}")
 
@@ -355,6 +247,33 @@ class PTBonusCalc(_PluginBase):
         except Exception as e:
             logger.error(f"PT魔力计算器插件：form_options 失败: {e}", exc_info=True)
             return {"sites": [], "downloaders": [], "address_keyword_options": [], "sites_with_config_data": [], "suggested_site_mappings": {}}
+
+    def _api_downloader_tracker_options(self, data: Optional[dict] = Body(None)) -> Dict[str, Any]:
+        """根据前端传入的下载器列表，从下载器拉取种子并提取 Tracker 地址，返回站点地址映射下拉选项。"""
+        try:
+            data = data or {}
+            primary = utils.parse_list_config(data.get("primary_downloaders"))
+            aux = utils.parse_list_config(data.get("aux_downloaders"))
+            if primary or aux:
+                downloader_names = list(dict.fromkeys(primary + aux))
+            else:
+                downloader_names = utils.parse_list_config(data.get("sync_downloaders"))
+            if not downloader_names:
+                return {"address_keyword_options": []}
+            address_keyword_options = set()
+            downloader_torrents = downloader_fetcher.fetch_downloader_torrents(downloader_names)
+            for torrent in downloader_torrents.values():
+                tracker = torrent.get("tracker") or ""
+                if not tracker:
+                    continue
+                domain = utils.tracker_full_host(tracker)
+                if domain:
+                    address_keyword_options.add(domain)
+            sorted_options = sorted(address_keyword_options)
+            return {"address_keyword_options": [{"title": d, "value": d} for d in sorted_options]}
+        except Exception as e:
+            logger.error(f"PT魔力计算器插件：downloader_tracker_options 失败: {e}", exc_info=True)
+            return {"address_keyword_options": []}
 
     def _on_site_refreshed(self, event: Any) -> None:
         """站点刷新后，拉取页面解析并同步 torrent_activity、bonus_params 到插件存储"""
@@ -395,171 +314,182 @@ class PTBonusCalc(_PluginBase):
             return [s for s in all_sites if StringUtils.get_url_domain(s.get("domain") or "") in selected_domains]
         return all_sites
 
+    def _get_sites_to_query_from_plugindata(self, site_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """仅从 plugindata 取站点列表，供 Page 接口使用，不查主项目表。site_id 仅支持域名字符串筛选。"""
+        if not self.selected_sites:
+            return []
+        domains_to_query = list(self.selected_sites)
+        if site_id and isinstance(site_id, str) and "." in site_id and site_id in self.selected_sites:
+            domains_to_query = [site_id]
+        result = []
+        for domain in domains_to_query:
+            if not domain:
+                continue
+            info = self.get_data(f"site_info_{domain}")
+            if info and isinstance(info, dict) and info.get("url"):
+                result.append(info)
+        return result
+
     def _get_latest_userdata(self, domain_key: str):
         userdata_list = self.site_oper.get_userdata_by_domain(domain_key)
         if userdata_list and len(userdata_list) > 1:
             userdata_list = sorted(userdata_list, key=lambda u: (u.updated_day or "", u.updated_time or ""), reverse=True)
         return userdata_list[0] if userdata_list else None
 
-    def _tracker_full_host(self, tracker: str) -> str:
-        """获取 tracker 完整主机名（二级域名，如 tracker.example.com），用于地址映射匹配。"""
-        if not (tracker or "").strip():
-            return ""
-        s = str(tracker).strip()
-        if s.startswith("http://") or s.startswith("https://"):
-            _, netloc = StringUtils.get_url_netloc(s)
-            if netloc:
-                return netloc.split(":")[0].lower()
-        elif "." in s and "://" not in s:
-            return s.split(":")[0].lower()
-        return s.lower()
-
-    def _keyword_to_domain(self, kw: Optional[str]) -> str:
-        if not kw:
-            return ""
-        k = str(kw).strip()
-        if "://" in k or ("." in k and "/" in k):
-            h = self._tracker_full_host(k)
-            return h or StringUtils.get_url_domain(k) or k
-        return k.lower()
-
-    def _get_bonus_seeding_data(self, site_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    def _get_bonus_seeding_data(self, site_id: Optional[str] = None, use_plugindata_only: bool = False) -> List[Dict[str, Any]]:
         try:
-            sites_to_query = self._get_sites_to_query(site_id, filter_by_selected_sites=True)
+            if use_plugindata_only:
+                sites_to_query = self._get_sites_to_query_from_plugindata(site_id)
+            else:
+                sites_to_query = self._get_sites_to_query(site_id, filter_by_selected_sites=True)
         except Exception as e:
             logger.error(f"PT魔力计算器插件：_get_bonus_seeding_data 失败: {e}", exc_info=True)
             raise
-
-        if self.sync_downloaders:
-            downloader_torrents = self._fetch_downloader_torrents()
-            torrents_by_domain = self._build_torrents_by_tracker_domain(downloader_torrents)
-        else:
-            downloader_torrents = {}
-            torrents_by_domain = {}
 
         result = []
         for site in sites_to_query:
             try:
                 domain_key = StringUtils.get_url_domain(site.get("domain") or "")
-                userdata = self._get_latest_userdata(domain_key)
                 bonus_params = self.get_data(f"bonus_params_{domain_key}") or {}
                 if not isinstance(bonus_params, dict):
                     bonus_params = {}
-                if not bonus_params and userdata:
-                    bonus_params = getattr(userdata, "bonus_params", None) or {}
-                seeding_list = []
+
+                pairs = []
                 try:
-                    pairs = seedinfo_oper.list_seed_with_latest_snapshot_by_site(None, domain_key)
-                    for seed, snap in pairs:
-                        if snap and snap.web_status == "not_exists":
-                            continue
-                        seeders = (snap.seeders or 0) if snap else 0
-                        weight = (snap.weight or 1.0) if snap else 1.0
-                        torrent_id = seed.torrent_key if seed.torrent_key and str(seed.torrent_key).isdigit() else None
-                        seeding_list.append({
-                            "seeders": seeders,
-                            "size": seed.size or 0,
-                            "pubdate": seed.pubdate,
-                            "torrent_id": torrent_id,
-                            "name": seed.name or "—",
-                            "weight": weight,
-                        })
+                    pairs = seedinfo_oper.list_seed_with_latest_snapshot_by_site(None, domain_key, self.sync_downloaders)
                 except Exception:
                     pass
-                if not seeding_list and userdata:
-                    activity = getattr(userdata, "torrent_activity", None) or {}
-                    seeding_list = activity.get("seeding") if isinstance(activity, dict) else []
-                if not isinstance(seeding_list, list):
-                    seeding_list = []
-                if not userdata and not seeding_list:
-                    continue
+                if not pairs and site.get("schema") == "NexusPhp" and site.get("url"):
+                    try:
+                        sync_from_fetch(site, self)
+                        pairs = seedinfo_oper.list_seed_with_latest_snapshot_by_site(None, domain_key, self.sync_downloaders)
+                    except Exception as e:
+                        logger.warning(f"PT魔力计算器插件：无数据时页面解析失败 {domain_key}: {e}")
+
+                T0 = int(bonus_params.get("T0") or 0)
+                N0 = int(bonus_params.get("N0") or 0)
+                B0 = int(bonus_params.get("B0") or 0)
+                L = int(bonus_params.get("L") or 0)
+                has_params = all((T0, N0, B0, L))
+
+                address_mappings = list(self.site_address_mappings.get(domain_key, []))
+                mapping_domains = set()
+                for kw in address_mappings:
+                    if kw:
+                        d = utils.keyword_to_domain(str(kw).strip())
+                        if d:
+                            mapping_domains.add(d)
+
+                rows = []
+                for site_seed, site_snap, dl_seed, dl_snap in pairs:
+                    if site_snap and site_snap.web_status == "not_exists":
+                        continue
+                    seeders = (site_snap.seeders or 0) if site_snap else 0
+                    weight = (site_snap.weight or 1.0) if site_snap else 1.0
+                    size_b = int(site_seed.size or 0)
+                    S_GB = size_b / (1024 ** 3) if size_b else 0.0
+                    pubdate = site_seed.pubdate
+                    T_weeks = utils.parse_pubdate_weeks(pubdate) or 0.0
+                    if site_snap and site_snap.T_weeks:
+                        T_weeks = float(site_snap.T_weeks) or T_weeks
+                    weight_val = float(weight) if weight is not None else float(bonus_params.get("default_weight") or 1.0)
+                    if has_params:
+                        bonus_per_hour, A_value, A_per_GB = utils.calc_bonus_per_hour(T_weeks, S_GB, seeders, T0, N0, B0, L, weight_val)
+                    else:
+                        bonus_per_hour = 0.0
+                        A_value = 0.0
+                        A_per_GB = 0.0
+                    torrent_id = site_seed.torrent_id if site_seed.torrent_id and str(site_seed.torrent_id).isdigit() else None
+                    tkey = site_seed.torrent_id or utils.torrent_key(torrent_id, site_seed.name or "", size_b)
+
+                    raw_hash = (dl_seed.downloader_hash if dl_seed else None) or None
+                    seed_tracker_domain = (dl_seed.tracker_domain if dl_seed else "") or (utils.tracker_domain_group_key(dl_seed.tracker or "") if dl_seed and dl_seed.tracker else "")
+                    if mapping_domains:
+                        matched_hash = raw_hash if (raw_hash and seed_tracker_domain in mapping_domains) else None
+                    else:
+                        matched_hash = None
+                    row_data = {
+                        "name": site_seed.name or "—",
+                        "size": size_b,
+                        "seeders": seeders,
+                        "pubdate": pubdate or "—",
+                        "torrent_id": torrent_id,
+                        "torrent_key": tkey,
+                        "T_weeks": round(T_weeks, 2),
+                        "A_value": A_value,
+                        "A_per_GB": A_per_GB,
+                        "bonus_per_hour": bonus_per_hour,
+                        "matched": bool(matched_hash),
+                        "downloader_hash": raw_hash,
+                    }
+                    if raw_hash and dl_seed:
+                        row_data["downloader_name"] = dl_seed.downloader_name or ""
+                        row_data["downloader_torrent_name"] = (getattr(dl_seed, "downloader_torrent_name", None) or "") or ""
+                        row_data["downloader_size"] = dl_seed.size or 0
+                        row_data["downloader_tracker"] = dl_seed.tracker or ""
+                        row_data["downloader_tracker_domain"] = dl_seed.tracker_domain or ""
+                        row_data["downloader_ratio"] = (dl_snap.ratio if dl_snap else None) or 0.0
+                        row_data["downloader_uploaded"] = (dl_snap.uploaded if dl_snap else None) or 0
+                        row_data["downloader_downloaded"] = (dl_snap.downloaded if dl_snap else None) or 0
+                        row_data["downloader_seeding_time"] = (dl_snap.seeding_time if dl_snap else None) or 0
+                        row_data["downloader_state"] = (dl_snap.downloader_status if dl_snap else None) or ""
+                        row_data["downloader_status"] = row_data["downloader_state"]
+                        row_data["downloader_save_path"] = (dl_snap.save_path if dl_snap else None) or ""
+                        row_data["downloader_category"] = (dl_snap.category if dl_snap else None) or ""
+                        row_data["downloader_tags"] = (dl_snap.tags if dl_snap else None) or ""
+                        row_data["downloader_added_at"] = dl_seed.added_at
+                    rows.append(row_data)
+
+                rows.sort(key=lambda x: x["bonus_per_hour"], reverse=True)
+                total_A = sum(r["A_value"] for r in rows)
+                total_A = math.floor(total_A * 10) / 10
+                if has_params and total_A > 0:
+                    total_bonus = B0 * (2.0 / math.pi) * math.atan(total_A / L)
+                else:
+                    total_bonus = 0.0
+                seed_bonus = float(bonus_params.get("seeding_bonus_per_seed") or 0)
+                seed_cap = int(bonus_params.get("seeding_bonus_cap") or 0)
+                if seed_bonus > 0 and seed_cap > 0:
+                    total_bonus += seed_bonus * min(len(rows), seed_cap)
+                decimals = int(bonus_params.get("hourly_bonus_decimals") or 2)
+                total_bonus = math.floor(total_bonus * (10 ** decimals)) / (10 ** decimals)
+                result.append({
+                    "site_name": site.get("name") or domain_key,
+                    "domain": domain_key,
+                    "address_mappings": address_mappings,
+                    "bonus_params": bonus_params,
+                    "has_bonus_params": has_params,
+                    "torrents": rows,
+                    "total_bonus_per_hour": round(total_bonus, decimals),
+                })
             except Exception as e:
                 logger.error(f"PT魔力计算器插件：处理站点出错: {e}", exc_info=True)
                 continue
-            T0 = int(bonus_params.get("T0") or 0)
-            N0 = int(bonus_params.get("N0") or 0)
-            B0 = int(bonus_params.get("B0") or 0)
-            L = int(bonus_params.get("L") or 0)
-            has_params = all((T0, N0, B0, L))
 
-            rows = []
-            for s in seeding_list:
-                if not isinstance(s, dict):
-                    continue
-                size_val = float(s.get("size") or 0)
-                if size_val > 0 and size_val < 1024 * 1024:
-                    S_GB = size_val
-                    size_b = int(size_val * (1024 ** 3))
-                else:
-                    S_GB = size_val / (1024 ** 3) if size_val else 0.0
-                    size_b = int(size_val)
-                N = int(s.get("seeders") or 0)
-                pubdate = s.get("pubdate")
-                T_weeks = _parse_pubdate_weeks(pubdate) or 0.0
-                weight = s.get("weight") if "weight" in s else s.get("wi")
-                weight = float(weight) if weight is not None else float(bonus_params.get("default_weight") or 1.0)
-                if has_params:
-                    bonus_per_hour, A_value, A_per_GB = _calc_bonus_per_hour(T_weeks, S_GB, N, T0, N0, B0, L, weight)
-                else:
-                    bonus_per_hour, A_value, A_per_GB = 0.0, 0.0, 0.0
-                matched_hash = None
-                downloader_data = None
-                if downloader_torrents and self.site_address_mappings.get(domain_key):
-                    candidate_torrents = self._get_candidate_torrents_for_site(domain_key, downloader_torrents, torrents_by_domain)
-                    matched_hash, _ = self._match_torrent(s, domain_key, candidate_torrents)
-                    if matched_hash and matched_hash in downloader_torrents:
-                        downloader_data = downloader_torrents[matched_hash]
-
-                tkey = _torrent_key(s.get("torrent_id"), s.get("name") or "", size_b)
-                row_data = {
-                    "name": s.get("name") or "—",
-                    "size": size_b,
-                    "seeders": N,
-                    "pubdate": pubdate or "—",
-                    "torrent_id": s.get("torrent_id"),
-                    "torrent_key": tkey,
-                    "T_weeks": round(T_weeks, 2),
-                    "A_value": A_value,
-                    "A_per_GB": A_per_GB,
-                    "bonus_per_hour": bonus_per_hour,
-                    "matched": matched_hash is not None,
-                    "downloader_hash": matched_hash,
-                }
-                if downloader_data:
-                    row_data.update({
-                        "downloader_ratio": downloader_data.get("ratio", 0.0),
-                        "downloader_uploaded": downloader_data.get("uploaded", 0),
-                        "downloader_downloaded": downloader_data.get("downloaded", 0),
-                        "downloader_seeding_time": downloader_data.get("seeding_time", 0),
-                        "downloader_state": downloader_data.get("state", ""),
-                        "downloader_name": downloader_data.get("downloader", ""),
-                        "downloader_save_path": downloader_data.get("save_path", ""),
-                        "downloader_category": downloader_data.get("category", ""),
-                        "downloader_tags": downloader_data.get("tags", ""),
-                    })
-                rows.append(row_data)
-
-            rows.sort(key=lambda x: x["bonus_per_hour"], reverse=True)
-            total_A = sum(r["A_value"] for r in rows)
-            total_A = math.floor(total_A * 10) / 10
-            if has_params and total_A > 0:
-                total_bonus = B0 * (2.0 / math.pi) * math.atan(total_A / L)
-            else:
-                total_bonus = 0.0
-            seed_bonus = float(bonus_params.get("seeding_bonus_per_seed") or 0)
-            seed_cap = int(bonus_params.get("seeding_bonus_cap") or 0)
-            if seed_bonus > 0 and seed_cap > 0:
-                total_bonus += seed_bonus * min(len(rows), seed_cap)
-            decimals = int(bonus_params.get("hourly_bonus_decimals") or 2)
-            total_bonus = math.floor(total_bonus * (10 ** decimals)) / (10 ** decimals)
-            result.append({
-                "site_name": site.get("name") or domain_key,
-                "domain": domain_key,
-                "bonus_params": bonus_params,
-                "has_bonus_params": has_params,
-                "torrents": rows,
-                "total_bonus_per_hour": round(total_bonus, decimals),
-            })
+        if self.sync_downloaders:
+            try:
+                downloader_by_domain = downloader_fetcher.fetch_downloader_torrents_by_domain(self.sync_downloaders) or {}
+            except Exception as e:
+                logger.debug(f"PT魔力计算器插件：拉取下载器种子失败: {e}")
+                downloader_by_domain = {}
+            hash_to_dt = {
+                h: dt
+                for by_hash in downloader_by_domain.values()
+                for h, dt in by_hash.items()
+            }
+            by_downloader: Dict[str, List[Dict[str, Any]]] = {}
+            for _h, dt in hash_to_dt.items():
+                dn = dt.get("downloader") or ""
+                if dn:
+                    by_downloader.setdefault(dn, []).append(dt)
+            for downloader_name, list_dt in by_downloader.items():
+                _attr = "main" if downloader_name in (self.primary_downloaders or []) else ("aux" if downloader_name in (self.aux_downloaders or []) else None)
+                for _dt in list_dt:
+                    _dt["seed_attr"] = _attr
+                try:
+                    seedinfo_oper.batch_upsert_downloader_torrents(None, downloader_name, list_dt)
+                except Exception as e:
+                    logger.debug(f"PT魔力计算器插件：批量写入下载器种子表失败 {downloader_name}: {e}")
         return result
 
     def _api_bonus_data(self, data: Optional[dict] = Body(None)):
@@ -573,8 +503,8 @@ class PTBonusCalc(_PluginBase):
             if "sync_downloaders" in data:
                 override["sync_downloaders"] = data["sync_downloaders"]
             if "primary_downloaders" in data or "aux_downloaders" in data:
-                prim = _parse_list_config(data.get("primary_downloaders"))
-                aux = _parse_list_config(data.get("aux_downloaders"))
+                prim = utils.parse_list_config(data.get("primary_downloaders"))
+                aux = utils.parse_list_config(data.get("aux_downloaders"))
                 override["sync_downloaders"] = list(dict.fromkeys(prim + aux))
             if "site_address_mappings" in data and isinstance(data["site_address_mappings"], dict):
                 override["site_address_mappings"] = data["site_address_mappings"]
@@ -583,102 +513,13 @@ class PTBonusCalc(_PluginBase):
                 site_id=site_id,
                 keyword=keyword,
             )
-            return {"success": True, **payload}
+            return {"success": True, "sites": payload.get("sites", [])}
         except Exception as e:
             logger.error(f"PT魔力计算器插件：bonus_data 失败: {e}", exc_info=True)
-            return {"success": False, "message": str(e), "sites": [], "total_unmatched_count": 0, "unmatched_by_site": {}, "sites_with_config_data": [], "site_fully_matched": {}, "downloader_torrents": []}
-
-    def _get_qb_instance(self, downloader_name: str):
-        try:
-            module_manager = ModuleManager()
-            qb_modules = list(module_manager.get_running_subtype_module(DownloaderType.Qbittorrent))
-            if not qb_modules:
-                return None
-            return qb_modules[0].get_instance(downloader_name)
-        except Exception as e:
-            logger.error(f"PT魔力计算器插件：获取下载器实例失败 {downloader_name}: {e}", exc_info=True)
-            return None
-
-    def _fetch_downloader_torrents(self) -> Dict[str, Dict[str, Any]]:
-        all_torrents = {}
-        for downloader_name in self.sync_downloaders:
-            qb_instance = self._get_qb_instance(downloader_name)
-            if not qb_instance:
-                continue
-            try:
-                torrents, error = qb_instance.get_torrents()
-                if error or not torrents:
-                    continue
-                for torrent in torrents:
-                    hash_value = torrent.get("hash")
-                    if not hash_value:
-                        continue
-                    tracker = torrent.get("tracker") or ""
-                    if not tracker and isinstance(torrent.get("trackers"), list) and torrent["trackers"]:
-                        first = torrent["trackers"][0]
-                        tracker = (first.get("url") if isinstance(first, dict) else str(first)) or ""
-
-                    all_torrents[hash_value] = {
-                        "hash": hash_value,
-                        "downloader": downloader_name,
-                        "name": torrent.get("name") or "",
-                        "total_size": torrent.get("total_size") or 0,
-                        "ratio": torrent.get("ratio") or 0.0,
-                        "uploaded": torrent.get("uploaded") or 0,
-                        "downloaded": torrent.get("downloaded") or 0,
-                        "seeding_time": torrent.get("seeding_time") or 0,
-                        "state": torrent.get("state") or "",
-                        "tracker": tracker,
-                        "save_path": torrent.get("save_path") or "",
-                        "category": torrent.get("category") or "",
-                        "tags": torrent.get("tags") or "",
-                        "added_on": torrent.get("added_on"),
-                    }
-            except Exception as e:
-                logger.error(f"PT魔力计算器插件：拉取下载器种子失败: {e}", exc_info=True)
-        return all_torrents
-
-    def _tracker_domain_group_key(self, tracker: str) -> str:
-        if not (tracker or "").strip():
-            return "__no_tracker__"
-        return self._tracker_full_host(tracker) or "__no_tracker__"
-
-    def _build_torrents_by_tracker_domain(self, downloader_torrents: Dict[str, Dict[str, Any]]) -> Dict[str, List[str]]:
-        by_domain: Dict[str, List[str]] = {}
-        for hash_value, t in downloader_torrents.items():
-            gk = self._tracker_domain_group_key((t.get("tracker") or "").strip())
-            by_domain.setdefault(gk, []).append(hash_value)
-        return by_domain
-
-    def _get_candidate_torrents_for_site(
-        self,
-        site_domain: str,
-        downloader_torrents: Dict[str, Dict[str, Any]],
-        torrents_by_domain: Dict[str, List[str]],
-    ) -> Dict[str, Dict[str, Any]]:
-        keywords = self.site_address_mappings.get(site_domain, [])
-        if not keywords:
-            return downloader_torrents
-        keyword_domains = set()
-        for kw in keywords:
-            k = (kw or "").strip()
-            if not k:
-                continue
-            d = self._keyword_to_domain(k)
-            if d:
-                keyword_domains.add(d)
-        if not keyword_domains:
-            return downloader_torrents
-        candidate_hashes = []
-        for gk, hashes in torrents_by_domain.items():
-            if gk in keyword_domains:
-                candidate_hashes.extend(hashes)
-        if not candidate_hashes:
-            return downloader_torrents
-        return {h: downloader_torrents[h] for h in candidate_hashes if h in downloader_torrents}
+            return {"success": False, "message": str(e), "sites": []}
 
     def _downloader_torrents_list(self, keyword: Optional[str] = None) -> List[Dict[str, Any]]:
-        downloader_torrents = self._fetch_downloader_torrents()
+        downloader_torrents = downloader_fetcher.fetch_downloader_torrents(self.sync_downloaders)
         result = []
         for hash_value, torrent in downloader_torrents.items():
             name = torrent.get("name", "")
@@ -690,38 +531,17 @@ class PTBonusCalc(_PluginBase):
 
     def _get_torrent_mappings(self) -> Dict[str, str]:
         try:
-            return seedinfo_oper.list_all_mappings(None)
+            return seedinfo_oper.list_all_mappings(None, self.sync_downloaders)
         except Exception:
             return {}
 
     def _save_torrent_mapping(self, site_domain: str, torrent_key: str, downloader_hash: str, site_data: Optional[Dict[str, Any]] = None, downloader_data: Optional[Dict[str, Any]] = None):
-        sd = site_data
-        if not sd:
-            pair = seedinfo_oper.get_seed_with_latest_snapshot(None, site_domain, torrent_key)
-            if pair:
-                seed, snap = pair
-                sd = {
-                    "name": seed.name,
-                    "size": seed.size,
-                    "pubdate": seed.pubdate,
-                    "seeders": snap.seeders if snap else 0,
-                    "weight": snap.weight if snap else 1.0,
-                }
-        if not sd:
-            sd = {"torrent_key": torrent_key}
-        dd = downloader_data
-        if not dd and downloader_hash and self.sync_downloaders:
-            try:
-                dt = self._fetch_downloader_torrents()
-                dd = dt.get(downloader_hash)
-            except Exception:
-                pass
-        if not dd and downloader_hash:
-            dd = {"hash": downloader_hash}
-        if dd and not dd.get("hash"):
-            dd["hash"] = downloader_hash
         try:
-            seedinfo_oper.save_seed_info(None, site_domain, torrent_key, sd, dd)
+            seedinfo_oper.save_torrent_mapping(
+                None, site_domain, torrent_key, downloader_hash,
+                self.sync_downloaders, self.primary_downloaders, self.aux_downloaders,
+                site_data, downloader_data,
+            )
         except Exception as e:
             logger.debug(f"PT魔力计算器插件：保存种子信息表失败: {e}")
 
@@ -737,23 +557,25 @@ class PTBonusCalc(_PluginBase):
         site_id: Optional[str] = None,
         keyword: Optional[str] = None,
     ) -> Dict[str, Any]:
-        backup = {"selected_sites": self.selected_sites, "sync_downloaders": self.sync_downloaders, "site_address_mappings": dict(self.site_address_mappings)}
+        backup = {"selected_sites": self.selected_sites, "sync_downloaders": self.sync_downloaders, "primary_downloaders": self.primary_downloaders, "aux_downloaders": self.aux_downloaders, "site_address_mappings": dict(self.site_address_mappings)}
         try:
             if override_config:
                 if "selected_sites" in override_config:
-                    self.selected_sites = _parse_list_config(override_config["selected_sites"])
+                    self.selected_sites = utils.parse_list_config(override_config["selected_sites"])
                 if "sync_downloaders" in override_config:
-                    self.sync_downloaders = _parse_list_config(override_config["sync_downloaders"])
+                    self.sync_downloaders = utils.parse_list_config(override_config["sync_downloaders"])
                 elif "primary_downloaders" in override_config or "aux_downloaders" in override_config:
-                    prim = _parse_list_config(override_config.get("primary_downloaders"))
-                    aux = _parse_list_config(override_config.get("aux_downloaders"))
+                    prim = utils.parse_list_config(override_config.get("primary_downloaders"))
+                    aux = utils.parse_list_config(override_config.get("aux_downloaders"))
+                    self.primary_downloaders = prim
+                    self.aux_downloaders = aux
                     self.sync_downloaders = list(dict.fromkeys(prim + aux))
                 if "site_address_mappings" in override_config and isinstance(override_config["site_address_mappings"], dict):
                     self.site_address_mappings = {k: (v if isinstance(v, list) else [str(v)]) for k, v in override_config["site_address_mappings"].items()}
 
             if not self.sites_helper:
                 self.sites_helper = SitesHelper()
-            unmatched_torrents_data = self._get_bonus_seeding_data(site_id)
+            unmatched_torrents_data = self._get_bonus_seeding_data(site_id, use_plugindata_only=True)
             unmatched_by_site = {}
             total_unmatched_count = 0
             for site_block in unmatched_torrents_data:
@@ -769,7 +591,7 @@ class PTBonusCalc(_PluginBase):
                             "torrent_id": torrent.get("torrent_id"),
                             "name": torrent.get("name", ""),
                             "size": torrent.get("size", 0),
-                            "torrent_key": _torrent_key(torrent.get("torrent_id"), torrent.get("name", ""), torrent.get("size", 0)),
+                            "torrent_key": utils.torrent_key(torrent.get("torrent_id"), torrent.get("name", ""), torrent.get("size", 0)),
                         })
                         total_unmatched_count += 1
                 if unmatched_torrents:
@@ -800,9 +622,19 @@ class PTBonusCalc(_PluginBase):
             downloader_torrents_dict = {}
             if self.sync_downloaders:
                 try:
-                    downloader_torrents_dict = self._fetch_downloader_torrents()
+                    dl_pairs = seedinfo_oper.list_downloader_seeds_with_latest_snapshot(None, self.sync_downloaders)
+                    for dl_seed, dl_snap in dl_pairs:
+                        h = dl_seed.downloader_hash
+                        downloader_torrents_dict[h] = {
+                            "hash": h,
+                            "name": getattr(dl_seed, "downloader_torrent_name", None) or "",
+                            "total_size": dl_seed.size or 0,
+                            "ratio": (dl_snap.ratio if dl_snap else None) or 0.0,
+                            "tracker": dl_seed.tracker or "",
+                            "downloader": dl_seed.downloader_name or "",
+                        }
                 except Exception as e:
-                    logger.error(f"PT魔力计算器插件：获取下载器种子失败: {e}", exc_info=True)
+                    logger.error(f"PT魔力计算器插件：从表获取下载器种子失败: {e}", exc_info=True)
 
             for site_domain, site_data in unmatched_by_site.items():
                 site_keywords = self.site_address_mappings.get(site_domain, [])
@@ -815,7 +647,7 @@ class PTBonusCalc(_PluginBase):
                     k = (kw or "").strip()
                     if k:
                         match_terms.add(k.lower())
-                        d = self._keyword_to_domain(k)
+                        d = utils.keyword_to_domain(k)
                         if d:
                             match_terms.add(d.lower())
                 site_filtered_dict = {}
@@ -836,8 +668,8 @@ class PTBonusCalc(_PluginBase):
                     name = dl_torrent.get("name") or ""
                     size_str = StringUtils.str_filesize(dl_torrent.get("total_size", 0))
                     suffix = f" ({size_str})"
-                    max_name_width = 48 - _display_width(suffix)
-                    short_name, _ = _truncate_by_display_width(name, max_name_width)
+                    max_name_width = 48 - utils.display_width(suffix)
+                    short_name, _ = utils.truncate_by_display_width(name, max_name_width)
                     site_filtered_list.append({"display": short_name + suffix, "value": hash_value, "title": name})
                 site_filtered_list.sort(key=lambda x: x["display"])
                 for unmatched in site_data["torrents"]:
@@ -858,7 +690,7 @@ class PTBonusCalc(_PluginBase):
                             "tracker": t.get("tracker") or "",
                             "downloader": t.get("downloader") or "",
                         })
-                    torrents_by_domain = self._build_torrents_by_tracker_domain(downloader_torrents_dict)
+                    torrents_by_domain = utils.build_torrents_by_tracker_domain(downloader_torrents_dict)
                     logger.info(f"PT魔力计算器[bonus_data] torrents_by_domain keys={list(torrents_by_domain.keys())[:15]}")
                     for block in unmatched_torrents_data:
                         domain = block.get("domain", "")
@@ -867,7 +699,7 @@ class PTBonusCalc(_PluginBase):
                         if not keywords:
                             downloader_torrents_by_site[domain] = []
                         else:
-                            candidate = self._get_candidate_torrents_for_site(domain, downloader_torrents_dict, torrents_by_domain)
+                            candidate = utils.get_candidate_torrents_for_site(domain, downloader_torrents_dict, torrents_by_domain, self.site_address_mappings)
                             downloader_torrents_by_site[domain] = [
                                 {"hash": h, "name": t.get("name") or "", "total_size": t.get("total_size") or 0, "ratio": t.get("ratio") or 0.0, "tracker": t.get("tracker") or "", "downloader": t.get("downloader") or ""}
                                 for h, t in candidate.items()
@@ -889,62 +721,9 @@ class PTBonusCalc(_PluginBase):
         finally:
             self.selected_sites = backup["selected_sites"]
             self.sync_downloaders = backup["sync_downloaders"]
+            self.primary_downloaders = backup["primary_downloaders"]
+            self.aux_downloaders = backup["aux_downloaders"]
             self.site_address_mappings = backup["site_address_mappings"]
-
-    def _normalize_name(self, name: str) -> str:
-        if not name:
-            return ""
-        normalized = name.lower()
-        for char in ['.', '_', '-', '[', ']', '(', ')', '{', '}']:
-            normalized = normalized.replace(char, ' ')
-        return re.sub(r'\s+', ' ', normalized).strip()
-
-    def _name_similarity(self, name1: str, name2: str) -> float:
-        if not name1 or not name2:
-            return 0.0
-        norm1, norm2 = self._normalize_name(name1), self._normalize_name(name2)
-        if norm1 == norm2:
-            return 1.0
-        if norm1 in norm2 or norm2 in norm1:
-            shorter, longer = min(len(norm1), len(norm2)), max(len(norm1), len(norm2))
-            return shorter / longer if longer > 0 else 0.0
-        words1, words2 = set(norm1.split()), set(norm2.split())
-        if not words1 or not words2:
-            return 0.0
-        common, total = words1 & words2, words1 | words2
-        return len(common) / len(total) if total else 0.0
-
-    def _match_torrent(self, site_torrent: Dict[str, Any], site_domain: str, downloader_torrents: Dict[str, Dict[str, Any]]) -> Tuple[Optional[str], Optional[str]]:
-        torrent_id = site_torrent.get("torrent_id")
-        name = site_torrent.get("name") or ""
-        size = float(site_torrent.get("size") or 0)
-        mappings = self._get_torrent_mappings()
-        if torrent_id and f"{site_domain}|{torrent_id}" in mappings:
-            return (mappings[f"{site_domain}|{torrent_id}"], "手动映射")
-        if f"{site_domain}|{name}|{size}" in mappings:
-            return (mappings[f"{site_domain}|{name}|{size}"], "手动映射")
-        if not name or size <= 0:
-            return (None, None)
-        size_min, size_max = size * 0.99, size * 1.01
-        size_candidates = [(h, t) for h, t in downloader_torrents.items() if size_min <= (t.get("total_size") or 0) <= size_max]
-        if len(size_candidates) > 100:
-            candidates_with_sim = [(self._name_similarity(name, t.get("name") or ""), h, t) for h, t in size_candidates]
-            candidates_with_sim.sort(reverse=True, key=lambda x: x[0])
-            size_candidates = [(h, t) for _, h, t in candidates_with_sim[:50]]
-        for hash_value, dl_torrent in size_candidates:
-            if self._name_similarity(name, dl_torrent.get("name") or "") >= 0.5:
-                return (hash_value, "大小+名称相似度")
-        return (None, None)
-
-    def _format_seeding_time(self, seconds: int) -> str:
-        if seconds <= 0:
-            return "0秒"
-        days, hours, minutes = seconds // 86400, (seconds % 86400) // 3600, (seconds % 3600) // 60
-        if days > 0:
-            return f"{days}天{hours}小时"
-        if hours > 0:
-            return f"{hours}小时{minutes}分钟"
-        return f"{minutes}分钟"
 
     def _api_save_data(self, data: dict = Body(...)):
         """根据前端传入的 associations 批量保存或删除关联"""
