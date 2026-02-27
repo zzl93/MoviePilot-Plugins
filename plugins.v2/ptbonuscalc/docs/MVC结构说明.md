@@ -123,8 +123,10 @@ NexusPHP 页面解析：做种列表与魔力参数。
 | `parse_torrent_activity_nexusphp` | 解析做种页，返回做种列表及下页地址 |
 | `extract_userid_from_index_nexusphp` | 从首页解析 userid |
 
-### `server/models/seedinfo.py`、`server/models/__init__.py`
-四张表 ORM 模型：`SiteSeed`、`SiteSeedSnapshot`、`DownloaderSeed`、`DownloaderSeedSnapshot`；`__init__.py` 导出上述四类。
+### `server/models/site_seed.py`、`server/models/downloader_seed.py`、`server/models/__init__.py`
+- `site_seed.py`：站点种子 ORM（`SiteSeed`、`SiteSeedSnapshot`）。
+- `downloader_seed.py`：下载器种子 ORM（`DownloaderSeed`、`DownloaderSeedSnapshot`）。
+- `__init__.py`：从上述两文件导出四类。
 
 ---
 
@@ -148,7 +150,8 @@ app/plugins/ptbonuscalc/
     ├── page_parser.py       # Model：页面解析
     └── models/
         ├── __init__.py
-        └── seedinfo.py      # Model：ORM 实体
+        ├── site_seed.py     # Model：站点种子 ORM
+        └── downloader_seed.py  # Model：下载器种子 ORM
 ```
 
 - **__init__.py**：不实现业务、不定义转发方法；`get_api` 的路由 endpoint 直接绑定 `server.controller.*`（lambda 传入 plugin），事件监听直接绑定 `server.controller.on_site_refreshed`，`init_plugin` 内直接调用 `server.controller.init_plugin` 与 `server.seedinfo_oper.init_seedinfo_db` 等。

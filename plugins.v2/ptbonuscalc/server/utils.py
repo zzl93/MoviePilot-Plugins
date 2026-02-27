@@ -175,6 +175,67 @@ def tokenize_name_for_match(name: str) -> Set[str]:
     return tokens
 
 
+def tokenize_name_to_list(name: str) -> List[str]:
+    """对种子名称分词并保持顺序，返回 token 列表（小写，可重复）。用于顺序匹配。"""
+    if not name or not isinstance(name, str):
+        return []
+    s = re.sub(r"[.\-_\[\](){}\s]+", " ", name).strip()
+    if not s:
+        return []
+    tokens: List[str] = []
+    pattern = re.compile(r"([\u4e00-\u9fff]+)|([a-zA-Z0-9]+)")
+    for m in pattern.finditer(s):
+        cn, en = m.group(1), m.group(2)
+        if cn:
+            if jieba:
+                for w in jieba.cut(cn, HMM=False):
+                    w = (w or "").strip().lower()
+                    if len(w) >= 1:
+                        tokens.append(w)
+            else:
+                for c in cn:
+                    c = (c or "").strip().lower()
+                    if c:
+                        tokens.append(c)
+        if en:
+            tokens.append(en.lower())
+    return tokens
+
+
+def name_ordered_match_ratio(name1: str, name2: str) -> float:
+    """
+    名称匹配度：按分词后词语在 name2 中出现的顺序计算，返回 name1 中有多少比例的词在 name2 里按序出现。
+    返回值 [0,1]，>=0.5 视为名称匹配。
+    """
+    t1 = tokenize_name_to_list(name1 or "")
+    t2 = tokenize_name_to_list(name2 or "")
+    if not t1:
+        return 1.0 if not t2 else 0.0
+    j = 0
+    match_count = 0
+    for w in t1:
+        while j < len(t2):
+            if t2[j] == w:
+                match_count += 1
+                j += 1
+                break
+            j += 1
+    return match_count / len(t1)
+
+
+def name_match_at_least_n_tokens(name1: str, name2: str, min_tokens: int = 2) -> bool:
+    """名称匹配：分词后至少有 min_tokens 个词在两个名称中都出现即视为匹配。"""
+    t1 = tokenize_name_for_match(name1 or "")
+    t2 = tokenize_name_for_match(name2 or "")
+    return len(t1 & t2) >= min_tokens
+
+
+def size_match_tolerance(size1: int, size2: int, tolerance_bytes: int = 100 * 1024 * 1024) -> bool:
+    """大小匹配：允许正负 tolerance_bytes（默认 ±100MB）。"""
+    a, b = int(size1 or 0), int(size2 or 0)
+    return abs(a - b) <= tolerance_bytes
+
+
 def token_overlap_score(tokens_site: Set[str], tokens_dl: Set[str]) -> float:
     """名称 token 重叠度：Jaccard = |交|/|并|，无 token 时返回 0。"""
     if not tokens_site or not tokens_dl:

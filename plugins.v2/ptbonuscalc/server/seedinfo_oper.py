@@ -128,6 +128,7 @@ def batch_save_seeding_from_parser(
                 size=size_b,
                 pubdate=s.get("pubdate"),
                 seed_attr=s.get("seed_attr") or None,
+                detail_url=s.get("detail_url") or None,
             )
             db.add(row)
             db.flush()
@@ -138,6 +139,8 @@ def batch_save_seeding_from_parser(
                 row.pubdate = s.get("pubdate") or row.pubdate
             if "seed_attr" in s:
                 row.seed_attr = s.get("seed_attr") or None
+            if "detail_url" in s:
+                row.detail_url = s.get("detail_url") or None
 
         snap = db.query(SiteSeedSnapshot).filter(
             SiteSeedSnapshot.site_seed_id == row.id,
@@ -177,6 +180,12 @@ def batch_save_seeding_from_parser(
                 web_status="not_exists",
             )
             db.add(snap)
+
+
+@db_query
+def count_site_seeds_by_domain(db: Session, site_domain: str) -> int:
+    """按站点统计种子数量，用于 site_list 等展示。"""
+    return db.query(SiteSeed).filter(SiteSeed.site_domain == site_domain).count()
 
 
 @db_query
@@ -259,22 +268,33 @@ def upsert_downloader_seed(
     downloader_data: Dict[str, Any],
     site_seed_id: Optional[int] = None,
 ) -> Optional[DownloaderSeed]:
-    """写入或更新下载器种子主表及当日快照；可设置 site_seed_id 关联。"""
-    from app.plugins.ptbonuscalc.server.utils import parse_tracker_domain
+    """写入或更新下载器种子主表及当日快照；唯一性按 (tracker_domain, downloader_hash)。可设置 site_seed_id 关联。"""
+    from app.plugins.ptbonuscalc.server.utils import parse_tracker_domain, tracker_domain_group_key
 
     today = date.today()
     now_time_str = datetime.now().strftime("%H:%M:%S")
     tracker_raw = downloader_data.get("tracker") or downloader_data.get("downloader_tracker") or ""
-    _, tracker_domain = parse_tracker_domain(tracker_raw)
+    _, parse_domain = parse_tracker_domain(tracker_raw)
+    domain_key = tracker_domain_group_key(tracker_raw)
     added_on = downloader_data.get("added_on")
-    added_dt = datetime.fromtimestamp(added_on) if added_on else None
+    if added_on is None:
+        added_dt = None
+    elif isinstance(added_on, datetime):
+        added_dt = added_on
+    elif isinstance(added_on, (int, float)):
+        try:
+            added_dt = datetime.fromtimestamp(added_on)
+        except (ValueError, OSError):
+            added_dt = None
+    else:
+        added_dt = None
     size_val = downloader_data.get("total_size") or downloader_data.get("downloader_size") or downloader_data.get("size")
     size_b = int(size_val) if size_val is not None else 0
 
     row = (
         db.query(DownloaderSeed)
         .filter(
-            DownloaderSeed.downloader_name == downloader_name,
+            DownloaderSeed.tracker_domain == domain_key,
             DownloaderSeed.downloader_hash == downloader_hash,
         )
         .first()
@@ -287,7 +307,7 @@ def upsert_downloader_seed(
             downloader_torrent_name=seed_name or None,
             size=size_b,
             tracker=tracker_raw,
-            tracker_domain=tracker_domain or None,
+            tracker_domain=domain_key,
             added_at=added_dt,
             site_seed_id=site_seed_id,
             seed_attr=downloader_data.get("seed_attr") or None,
@@ -298,9 +318,10 @@ def upsert_downloader_seed(
         db.flush()
     else:
         row.downloader_torrent_name = seed_name or row.downloader_torrent_name
+        row.downloader_name = downloader_name
         row.size = size_b if size_b else row.size
         row.tracker = tracker_raw or row.tracker
-        row.tracker_domain = tracker_domain or row.tracker_domain
+        row.tracker_domain = domain_key
         row.added_at = added_dt or row.added_at
         if site_seed_id is not None:
             row.site_seed_id = site_seed_id
@@ -348,14 +369,18 @@ def clear_downloader_seed_site_seed_id(db: Session, site_seed_id: int) -> None:
 def list_downloader_seeds_with_latest_snapshot(
     db: Session,
     allowed_downloader_names: Optional[List[str]] = None,
+    tracker_domains: Optional[List[str]] = None,
 ) -> List[Tuple[DownloaderSeed, Optional[DownloaderSeedSnapshot]]]:
     """
-    从表里按所属下载器查所有下载器种子及各自最新快照。
-    allowed_downloader_names 非空时只查该列表内的下载器；用于 Page 展示（只读表，不调下载器 API）。
+    从表里按所属下载器查下载器种子及各自最新快照。
+    allowed_downloader_names 非空时只查该列表内的下载器。
+    tracker_domains 非空时只查 tracker_domain 在该列表内的种子（用于按站点映射在库内筛选右表数据）。
     """
     q = db.query(DownloaderSeed)
     if allowed_downloader_names is not None and len(allowed_downloader_names) > 0:
         q = q.filter(DownloaderSeed.downloader_name.in_(allowed_downloader_names))
+    if tracker_domains is not None and len(tracker_domains) > 0:
+        q = q.filter(DownloaderSeed.tracker_domain.in_(tracker_domains))
     seeds = q.all()
     result = []
     for seed in seeds:

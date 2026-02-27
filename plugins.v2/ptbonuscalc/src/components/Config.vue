@@ -1,6 +1,7 @@
 <template>
   <div class="config-page">
-    <v-card>
+    <div v-if="errorMessage" class="text-caption text-error mb-3">{{ errorMessage }}</div>
+    <v-card :loading="loading">
       <v-card-title>PT魔力计算器 - 配置</v-card-title>
       <v-card-text>
         <v-select
@@ -15,6 +16,7 @@
           hint="选择要显示的站点，留空则显示所有启用站点"
           persistent-hint
           class="mb-4"
+          @update:menu="onTopSelectMenuOpen"
         />
         <v-select
           v-model="form.primary_downloaders"
@@ -28,6 +30,7 @@
           hint="主种下载器，与辅种下载器互斥"
           persistent-hint
           class="mb-4"
+          @update:menu="onTopSelectMenuOpen"
         />
         <v-select
           v-model="form.aux_downloaders"
@@ -41,30 +44,35 @@
           hint="辅种下载器，与主下载器互斥"
           persistent-hint
           class="mb-4"
+          @update:menu="onTopSelectMenuOpen"
         />
         <div class="mb-4">
           <div class="text-h6 mb-2">站点地址映射</div>
           <div class="text-body-2 mb-3 text-grey">
-            配置站点域名与下载器中的地址关键词映射。下拉选项来自主/辅下载器中种子的 tracker 域名。请先在「显示站点」中选择要配置的站点。
+            配置站点域名与下载器中的地址关键词映射。需先在「显示站点」中选择要配置的站点，并在「主下载器」或「辅下载器」中至少选一个，保存或切回本页后会从下载器拉取地址选项。
           </div>
-          <template v-for="site in sitesForMapping" :key="site.value">
-            <div class="mb-3">
-              <div class="text-body-2 mb-1">{{ site.title }}</div>
-              <v-select
-                :model-value="getSiteMapping(site.value)"
-                @update:model-value="v => setSiteMapping(site.value, Array.isArray(v) ? v : [])"
-                :items="formOptions.address_keyword_options"
-                item-title="title"
-                item-value="value"
-                label="下载器地址关键词"
-                multiple
-                chips
-                density="compact"
-              />
-            </div>
+          <div v-if="!sitesForMapping.length" class="text-body-2 text-medium-emphasis">未选择显示站点时此处无配置项。</div>
+          <template v-else>
+            <div v-if="sitesForMapping.length && !formOptions.address_keyword_options.length" class="text-caption text-medium-emphasis mb-2">请先选择主下载器或辅下载器，保存或切回本页后即可拉取地址选项。</div>
+            <template v-for="site in sitesForMapping" :key="site.value">
+              <div class="mb-3">
+                <div class="text-body-2 mb-1">{{ site.title }}</div>
+                <v-select
+                  :model-value="getSiteMapping(site.value)"
+                  @update:model-value="v => setSiteMapping(site.value, Array.isArray(v) ? v : [])"
+                  :items="formOptions.address_keyword_options"
+                  item-title="title"
+                  item-value="value"
+                  label="下载器地址关键词"
+                  multiple
+                  chips
+                  density="compact"
+                />
+              </div>
+            </template>
           </template>
         </div>
-        <v-btn color="primary" @click="save" :loading="saving">保存配置</v-btn>
+        <v-btn color="primary" @click="save" :loading="saving" :disabled="loading">保存配置</v-btn>
       </v-card-text>
     </v-card>
   </div>
@@ -112,6 +120,18 @@ const formOptions = ref<{
 })
 
 const saving = ref(false)
+const loading = ref(false)
+const errorMessage = ref('')
+let topSelectRefreshTimer: ReturnType<typeof setTimeout> | null = null
+
+function onTopSelectMenuOpen(open: boolean) {
+  if (!open) return
+  if (topSelectRefreshTimer) return
+  topSelectRefreshTimer = setTimeout(() => {
+    topSelectRefreshTimer = null
+    fetchFormOptions()
+  }, 200)
+}
 
 const sitesForMapping = computed(() => {
   const selected = new Set((form.value.selected_sites as string[]) || [])
@@ -164,8 +184,10 @@ async function fetchDownloaderTrackerOptions() {
       aux_downloaders: aux,
     })) as { address_keyword_options?: { title: string; value: string }[] }
     formOptions.value.address_keyword_options = res?.address_keyword_options || []
+    errorMessage.value = ''
   } catch (e) {
     console.error('fetchDownloaderTrackerOptions', e)
+    errorMessage.value = (e as Error)?.message || '拉取地址选项失败'
   }
 }
 
@@ -195,8 +217,10 @@ async function fetchFormOptions() {
   try {
     const res = (await props.api.get(`${API}/form_options`)) as typeof formOptions.value
     formOptions.value = res || formOptions.value
+    errorMessage.value = ''
   } catch (e) {
     console.error('fetchFormOptions', e)
+    errorMessage.value = (e as Error)?.message || '加载配置选项失败'
   }
 }
 
@@ -223,8 +247,14 @@ function save() {
 }
 
 async function loadFormOptions() {
-  await fetchFormOptions()
-  await fetchDownloaderTrackerOptions()
+  loading.value = true
+  errorMessage.value = ''
+  try {
+    await fetchFormOptions()
+    await fetchDownloaderTrackerOptions()
+  } finally {
+    loading.value = false
+  }
 }
 
 onMounted(async () => {

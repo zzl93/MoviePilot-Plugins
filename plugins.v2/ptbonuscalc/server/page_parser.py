@@ -190,6 +190,7 @@ def parse_torrent_activity_nexusphp(
                         tid_match = re.search(r"details\.php\?id=(\d+)", details_href[0])
                         if tid_match:
                             torrent_id = tid_match.group(1)
+                    detail_path = details_href[0].strip() if details_href else None
                     details_title = row.xpath('.//a[contains(@href,"details.php?id=")]/@title')
                     if details_title and details_title[0]:
                         name = str(details_title[0]).strip()
@@ -204,6 +205,8 @@ def parse_torrent_activity_nexusphp(
                     "torrent_id": torrent_id,
                     "name": name or "—",
                 }
+                if detail_path:
+                    detail_item["detail_path"] = detail_path
                 if weight_col is not None:
                     detail_item["weight"] = seed_weight
                 page_seeding_detail.append(detail_item)
