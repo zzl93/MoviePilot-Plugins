@@ -1,0 +1,202 @@
+   1: """
+   2: 做种数据、关�?payload、保�?取消关联�?
+   3: """
+   4: from typing import Optional, List, Any
+   5: from app.db import ScopedSession
+   6: from app.plugins.ptbonuscalc.MVC.mappers.site_seed_mapper import SiteSeedMapper
+   7: from app.plugins.ptbonuscalc.MVC.mappers.downloader_seed_mapper import DownloaderSeedMapper
+   8: from app.plugins.ptbonuscalc.MVC.services import site_service
+   9: from app.plugins.ptbonuscalc.MVC.services import downloader_seed_service
+  10: from app.plugins.ptbonuscalc.MVC.utils import calc_bonus_per_hour
+  11: from app.db.plugindata_oper import PluginDataOper
+  12: 
+  13: 
+  14: def _plugin_id(plugin) -> str:
+  15:     return getattr(plugin, "plugin_id", None) or type(plugin).__name__
+  16: 
+  17: 
+  18: def get_bonus_seeding_data(
+  19:     plugin,
+  20:     site_id: Optional[int] = None,
+  21:     use_plugindata_only: bool = False,
+  22: ) -> List[dict]:
+  23:     """站点列表 + 每站 pairs；某站无数据且为 NexusPHP 时先 sync 再查。取 bonus_params、address_mappings，用 downloader_seed_service 得候选。算魔力、matched，拼 row �?downloader_candidates，汇�?total_*�?""
+  24:     if use_plugindata_only:
+  25:         sites = site_service.get_sites_from_plugindata(plugin, site_id=site_id)
+  26:     else:
+  27:         indexers = site_service.get_sites_to_query(plugin, site_id=site_id)
+  28:         sites = []
+  29:         for idx in indexers:
+  30:             domain = idx.get("domain") or ""
+  31:             site_block = {
+  32:                 "id": idx.get("id"),
+  33:                 "name": idx.get("name"),
+  34:                 "domain": domain,
+  35:                 "schema": idx.get("parser") or "NexusPHP",
+  36:                 "bonus_params": {},
+  37:                 "address_mappings": (getattr(plugin, "site_address_mappings", None) or {}).get(domain) or [],
+  38:             }
+  39:             sites.append(site_block)
+  40:     result_blocks = []
+  41:     db = ScopedSession()
+  42:     try:
+  43:         site_mapper = SiteSeedMapper(db)
+  44:         for site_block in sites:
+  45:             sid = site_block.get("id")
+  46:             domain = site_block.get("domain") or ""
+  47:             pairs = site_mapper.list_seed_with_latest_snapshot_by_site(sid) if sid is not None else []
+  48:             if not pairs and sid and site_block.get("schema", "").lower() in ("nexusphp", "nexus"):
+  49:                 db.close()
+  50:                 site_service.sync_site_seeding_data(site_block, plugin)
+  51:                 db = ScopedSession()
+  52:                 site_mapper = SiteSeedMapper(db)
+  53:                 pairs = site_mapper.list_seed_with_latest_snapshot_by_site(sid)
+  54:             candidates = downloader_seed_service.list_downloader_candidates_for_site(plugin, domain)
+  55:             bonus_params = site_block.get("bonus_params") or {}
+  56:             rows = []
+  57:             total_seed_count = 0
+  58:             total_bonus_per_hour = 0.0
+  59:             for item in pairs:
+  60:                 site_seed = item.get("site_seed")
+  61:                 site_snap = item.get("site_snapshot")
+  62:                 down_seed = item.get("downloader_seed")
+  63:                 down_snap = item.get("downloader_snapshot")
+  64:                 if not site_seed:
+  65:                     continue
+  66:                 size = (site_snap.size or 0) if site_snap else 0
+  67:                 seed_time = (site_snap.seed_time or 0) if site_snap else 0
+  68:                 bonus_per_hour = (site_snap.bonus_per_hour or 0.0) if site_snap else 0.0
+  69:                 if bonus_per_hour == 0 and bonus_params and seed_time and size:
+  70:                     bonus_per_hour = calc_bonus_per_hour(size, seed_time, bonus_params)
+  71:                 matched = bool(down_seed)
+  72:                 total_seed_count += 1
+  73:                 total_bonus_per_hour += bonus_per_hour
+  74:                 rows.append({
+  75:                     "site_seed_id": site_seed.id,
+  76:                     "name": site_seed.name,
+  77:                     "size": size,
+  78:                     "seed_time": seed_time,
+  79:                     "bonus_per_hour": bonus_per_hour,
+  80:                     "matched": matched,
+  81:                     "downloader_hash": down_seed.hash if down_seed else None,
+  82:                     "downloader_seed_id": down_seed.id if down_seed else None,
+  83:                 })
+  84:             result_blocks.append({
+  85:                 "site": site_block,
+  86:                 "rows": rows,
+  87:                 "downloader_candidates": candidates,
+  88:                 "total_seed_count": total_seed_count,
+  89:                 "total_bonus_per_hour": round(total_bonus_per_hour, 2),
+  90:             })
+  91:     finally:
+  92:         db.close()
+  93:     return result_blocks
+  94: 
+  95: 
+  96: def build_seed_association_payload(
+  97:     plugin,
+  98:     override_config: Optional[dict] = None,
+  99:     site_id: Optional[int] = None,
+ 100:     keyword: Optional[str] = None,
+ 101: ) -> dict:
+ 102:     """若有 override_config 临时覆盖 plugin 配置。调 get_bonus_seeding_data；筛未匹配、按 site_fully_matched/selected_sites 过滤；拼 options、right_table。返�?sites、downloader_torrents、downloader_torrents_by_site�?""
+ 103:     saved = {}
+ 104:     if override_config:
+ 105:         for k, v in override_config.items():
+ 106:             saved[k] = getattr(plugin, k, None)
+ 107:             setattr(plugin, k, v)
+ 108:     try:
+ 109:         blocks = get_bonus_seeding_data(plugin, site_id=site_id, use_plugindata_only=False)
+ 110:     finally:
+ 111:         for k, saved_v in saved.items():
+ 112:             if saved_v is not None:
+ 113:                 setattr(plugin, k, saved_v)
+ 114:             elif hasattr(plugin, k):
+ 115:                 delattr(plugin, k)
+ 116:     sites = [b["site"] for b in blocks]
+ 117:     downloader_torrents_by_site = {b["site"].get("domain") or b["site"].get("id"): b["downloader_candidates"] for b in blocks}
+ 118:     all_candidates = []
+ 119:     for b in blocks:
+ 120:         all_candidates.extend(b["downloader_candidates"])
+ 121:     seen = set()
+ 122:     downloader_torrents = []
+ 123:     for c in all_candidates:
+ 124:         h = c.get("hash")
+ 125:         if h and h not in seen:
+ 126:             seen.add(h)
+ 127:             downloader_torrents.append(c)
+ 128:     return {
+ 129:         "sites": sites,
+ 130:         "downloader_torrents": downloader_torrents,
+ 131:         "downloader_torrents_by_site": downloader_torrents_by_site,
+ 132:         "blocks": blocks,
+ 133:     }
+ 134: 
+ 135: 
+ 136: def apply_save_data(plugin, associations: List[dict]) -> tuple:
+ 137:     """遍历 associations（每项含 downloader_hash、site_seed_id 等），调 downloader_seed_mapper 保存；site_seed_id 为空即取消关联。返�?(success, message)�?""
+ 138:     if not associations:
+ 139:         return True, "无数据需要保�?
+ 140:     downloader_ids = getattr(plugin, "sync_downloaders", None) or []
+ 141:     if not isinstance(downloader_ids, list):
+ 142:         downloader_ids = []
+ 143:     db = ScopedSession()
+ 144:     try:
+ 145:         mapper = DownloaderSeedMapper(db)
+ 146:         for item in associations:
+ 147:             downloader_id = item.get("downloader_id") or (downloader_ids[0] if downloader_ids else "")
+ 148:             h = item.get("downloader_hash") or item.get("hash")
+ 149:             site_seed_id = item.get("site_seed_id")
+ 150:             if not h or not downloader_id:
+ 151:                 continue
+ 152:             mapper.upsert_downloader_seed(
+ 153:                 downloader_id=downloader_id,
+ 154:                 hash_value=h,
+ 155:                 snapshot_data=item.get("snapshot_data") or {"total_size": item.get("total_size", 0), "ratio": item.get("ratio", 0), "tracker": item.get("tracker"), "state": item.get("state")},
+ 156:                 site_seed_id=site_seed_id,
+ 157:                 name=item.get("name"),
+ 158:             )
+ 159:         db.commit()
+ 160:         return True, "保存成功"
+ 161:     except Exception as e:
+ 162:         db.rollback()
+ 163:         return False, str(e)
+ 164:     finally:
+ 165:         db.close()
+ 166: 
+ 167: 
+ 168: def sync_init_mappings_and_fully_matched(plugin, config: dict) -> None:
+ 169:     """�?config 解析 torrent_mapping_*，与 list_all_mappings 比较，将差异通过 mapper 写回；再根据 get_bonus_seeding_data �?site_fully_matched�?""
+ 170:     pid = _plugin_id(plugin)
+ 171:     pdo = PluginDataOper()
+ 172:     db = ScopedSession()
+ 173:     try:
+ 174:         mapper = DownloaderSeedMapper(db)
+ 175:         current = {f"{m['downloader_id']}_{m['downloader_hash']}": m for m in mapper.list_all_mappings()}
+ 176:         # 解析 config 中的 torrent_mapping_* �?
+ 177:         target = {}
+ 178:         for k, v in (config or {}).items():
+ 179:             if isinstance(k, str) and k.startswith("torrent_mapping_") and isinstance(v, dict):
+ 180:                 target[f"{v.get('downloader_id')}_{v.get('downloader_hash')}"] = v
+ 181:         for key, val in target.items():
+ 182:             if key in current and current[key].get("site_seed_id") == val.get("site_seed_id"):
+ 183:                 continue
+ 184:             mapper.upsert_downloader_seed(
+ 185:                 downloader_id=val.get("downloader_id", ""),
+ 186:                 hash_value=val.get("downloader_hash", ""),
+ 187:                 snapshot_data=val.get("snapshot_data") or {},
+ 188:                 site_seed_id=val.get("site_seed_id"),
+ 189:             )
+ 190:         db.commit()
+ 191:     except Exception:
+ 192:         db.rollback()
+ 193:         raise
+ 194:     finally:
+ 195:         db.close()
+ 196:     blocks = get_bonus_seeding_data(plugin, use_plugindata_only=False)
+ 197:     fully_matched = {}
+ 198:     for b in blocks:
+ 199:         site_domain = (b["site"].get("domain") or str(b["site"].get("id")) or "")
+ 200:         rows = b.get("rows") or []
+ 201:         fully_matched[site_domain] = all(r.get("matched") for r in rows) if rows else False
+ 202:     pdo.save(pid, "site_fully_matched", fully_matched)

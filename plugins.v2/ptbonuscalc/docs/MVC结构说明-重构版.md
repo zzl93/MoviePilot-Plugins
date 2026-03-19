@@ -1,0 +1,195 @@
+# 本地种子管理插件 - MVC 结构说明（重构版）
+
+本插件将站点做种与下载器种子拉到本地四张表统一管理，并在此基础上提供站点↔下载器关联、PT 魔力计算等能力。按 MVC + 服务层划分。**插件后端相关代码均放在 `MVC/` 下**。Controller 只有接口（API 与事件），所有 API/事件请求经 Controller 转发到 Service；init 不经过 Controller，由 __init__.init_plugin 直接调 Service。Service 为业务入口，可调主项目、Mapper 或 Utils。分层为 Entry → Controller → Service → Mapper → Model，Utils 跨层；**对插件四张表的持久化（读写 DB）仅经 Mapper**，Model 为表映射对象，Mapper 在持久化时使用，Service 可接收 Mapper 返回的 Model 实例并转为业务结构；插件 Mapper 按职责拆为三模块（seedinfo_db、site_seed_mapper、downloader_seed_mapper），不操作主项目其它表；主项目已具备的能力在 Service 中直接调用主项目。
+
+---
+
+## 1. 分层概览
+
+| 层级 | 职责 | 位置 |
+|------|------|------|
+| **Entry** | 插件生命周期、API/事件注册，不写业务 | `__init__.py` |
+| **Controller** | 仅接口层：接收 API 请求与事件，解析参数，调 Service，返回 | `MVC/controller.py` |
+| **Service** | 业务入口；站点/下载器表/做种与关联/配置与初始化，可调主项目、Mapper 或 Utils | `MVC/services/*.py` |
+| **Mapper/Oper** | 数据访问：插件四张表的持久化（CRUD）由此层完成。与主项目 db_update/db_query 装饰器机制一致：Mapper 类方法通过装饰器接收注入的 `db: Session`，不在内部创建 Session；Service 调用 Mapper 时无需管理 db（部分 Service 如 bonus_service 仍自行持 db，待统一） | `MVC/mappers/` |
+| **Model** | 表的映射对象（ORM 实体），定义在 models/；持久化由 Mapper 完成，其它层可接收 Mapper 返回的 Model 实例并做只读或转换 | `MVC/models/` |
+| **Utils** | 工具函数与可复用能力（Tracker 解析、魔力公式、页面解析 page_parser、下载器拉取 downloader_fetcher 等），由 Service 调用 | `MVC/utils/` |
+
+上表为后端分层；View（Vue 组件）为前端，不在此列。
+
+调用链：**API/事件** → __init__（get_api 绑定）→ Controller → Service；**init** → __init__.init_plugin 直接 → Service。**对 DB 的读写仅经 Mapper**；Mapper 方法通过装饰器使用注入的 db；downloader_seed_service 不持 db 只调 Mapper，bonus_service 等仍自行创建 Session 待统一；Service 可接收 Mapper 返回的 Model 实例并转为业务结构，但不绕过 Mapper 直接对 DB 做持久化。
+
+---
+
+## 2. 插件入口 `__init__.py`（Entry）
+
+- 保留基类要求的方法：`get_state`、`stop_service`、`get_command`、`get_render_mode`、`get_form`、`get_page`、`get_api`、`init_plugin`。
+- `init_plugin(config)`：从 config 解析并设置类属性（sync_downloaders、selected_sites、site_address_mappings）；注册站点刷新事件，回调 `controller.on_site_refreshed(plugin, event)`；**直接调用 Service**：`init_service.init_plugin_db(plugin)` → `site_service.write_site_infos_for_selected(plugin)` → `bonus_service.sync_init_mappings_and_fully_matched(plugin, config)`。不经过 Controller。
+- `get_api()`：路由 endpoint 指向 controller 的 API 方法（lambda 传入 plugin）。
+
+| 路径 | 方法 | 说明 |
+|------|------|------|
+| `/form_options` | GET | 配置页：站点、下载器、地址关键词选项等 |
+| `/downloader_tracker_options` | POST | 按下载器列表返回 Tracker 地址选项 |
+| `/site_list` | POST | 做种页表头：已选站点及种子总数、总时魔 |
+| `/bonus_data` | POST | 做种明细：左表 + 右表下载器候选（可带 site_id、keyword） |
+| `/save_data` | POST | 批量保存或取消站点种子与下载器关联 |
+
+---
+
+## 3. Controller 层 `MVC/controller.py`
+
+仅做接口层：接收 API 请求与事件，解析参数，调 Service，返回。**仅调 Service，不直接调 Mapper**（所有数据访问经 Service 转）。无 init_plugin。
+
+| 方法 | 入参 | 作用 |
+|------|------|------|
+| `on_site_refreshed(plugin, event)` | 插件实例、事件 | 调 site_service.trigger_sync_on_site_refresh |
+| `api_form_options(plugin)` | 插件实例 | 调 config_service.get_form_options，返回 |
+| `api_downloader_tracker_options(plugin, data)` | 插件实例、data | 调 config_service.get_downloader_tracker_options(plugin, data)，返回 |
+| `api_site_list(plugin, data)` | 插件实例、data | 可选从 data 取 site_id，调 site_service.get_sites_from_plugindata(plugin, site_id)，按前端所需结构组装后返回 |
+| `api_bonus_data(plugin, data)` | 插件实例、data | 从 data 解析参数（override_config、site_id、keyword 等）后调 bonus_service.build_seed_association_payload，从返回中取 left_table/right_table 按接口约定返回 |
+| `api_save_data(plugin, data)` | 插件实例、data | 从 data 取 associations，调 bonus_service.apply_save_data(plugin, associations)，返回 success、message |
+
+---
+
+## 4. Service 层 `MVC/services/`
+
+Service 为对外唯一业务入口。主项目已具备的能力（站点列表、下载器配置等）在 Service 中直接调主项目；插件四张表的**持久化**通过 Mapper/Oper 完成。Mapper 通过 `@db_update`/`@db_query` 装饰器管理 db；downloader_seed_service 不持 db 只调 Mapper，bonus_service 等仍自行创建 Session 待统一。Service 可接收 Mapper 返回的 Model 实例并转为业务结构，但不绕过 Mapper 直接对 DB 做增删改查。
+
+### 4.1 `init_service.py` — 插件与 DB 初始化
+
+| 方法 | 功能与逻辑 |
+|------|------------|
+| `init_plugin_db(plugin)` | 调 mappers/seedinfo_db.init_seedinfo_db() 建表及迁移。供 __init__.init_plugin 首先调用。 |
+
+### 4.2 `site_service.py` — 站点数据
+
+| 方法 | 功能与逻辑 |
+|------|------------|
+| `get_sites_to_query(plugin, site_id, filter_by_selected_sites)` | 若传 site_id 则从主项目站点表查该站 indexer 返回单元素列表；否则取主项目已启用站点并按 selected_sites 过滤。直接调主项目（SiteOper、sites_helper）。 |
+| `get_sites_from_plugindata(plugin, site_id)` | 从 PluginData 读 site_info_{domain}，可传 site_id 筛单站。返回项含基础信息、total_seed_count、total_bonus_per_hour（由 sync_site_seeding_data 写入）；bonus_params、has_bonus_params 在本方法内从 PluginData 等拼装后一并返回，供 api_site_list 做结构组装。 |
+| `write_site_infos_for_selected(plugin)` | 按 selected_sites 从主项目取各站 indexer，写入 PluginData 的 site_info_{domain}（name、domain、url、schema 等），并合并已存的 total_*。供 __init__.init_plugin 调用。 |
+| `sync_site_seeding_data(site, plugin)` | 从站点拉取做种数据的完整流程：发 HTTP 请求拉取 NexusPHP 做种页与 mybonus（调 utils 中 fetch 或 site_service 内封装）；调 utils/page_parser 解析；调 site_seed_mapper 的 batch_save_seeding_from_parser 等方法写站点种子表；写/更新 PluginData（site_info_*、bonus_params_*、total_seed_count、total_bonus_per_hour）。供 trigger_sync_on_site_refresh 及 bonus_service.get_bonus_seeding_data 在无数据时调用。 |
+| `trigger_sync_on_site_refresh(plugin, event)` | 从 event.event_data（或 event.data）取 site_id（单站 id 或 "*"），从主项目取对应站点信息，若为 NexusPHP 则调本模块 sync_site_seeding_data(site, plugin)；site_id 为 "*" 时对已选站点中 NexusPHP 逐站同步。供 Controller.on_site_refreshed 调用。 |
+
+### 4.3 `downloader_seed_service.py` — 下载器表数据查询与初步处理
+
+| 方法 | 功能与逻辑 |
+|------|------------|
+| `sync_downloader_seeds_from_api(plugin)` | 根据 plugin.sync_downloaders 从下载器 API 拉取种子，调 Mapper 的写入方法写入插件表；已有关联的 site_seed_id 保留。调用时机由上层决定（如 init、做种页打开前或定时）。 |
+| `list_downloader_seeds_with_snapshot(plugin, tracker_domains=None)` | 按 plugin.sync_downloaders 调 Mapper 的查询方法（如 list、get_by_downloader_id 等），可选 tracker_domains 筛选。将返回的 Model 转为业务结构（如字典列表）再向 Controller 暴露。 |
+| `list_downloader_candidates_for_site(plugin, site_domain)` | 按 site_address_mappings 取该站地址关键词并转为 tracker 域名集，再调 list_downloader_seeds_with_snapshot；结果整理为字典列表（hash、name、total_size、ratio、tracker、downloader）返回。 |
+| `get_downloader_seed_by_hash(plugin, downloader_hash, downloader_id=None)` | 调 Mapper 的查询方法得单条及最新快照，按需转为业务结构后返回。可选 downloader_id 限定下载器。 |
+
+### 4.4 `bonus_service.py` — 做种数据、关联 payload、保存/取消关联
+
+| 方法 | 功能与逻辑 |
+|------|------------|
+| `get_bonus_seeding_data(plugin, site_id, use_plugindata_only)` | 站点列表：use_plugindata_only 时调 site_service.get_sites_from_plugindata，否则 site_service.get_sites_to_query。对每站调 site_seed_mapper 的 list_seed_with_latest_snapshot_by_site 得 pairs；某站无数据且为 NexusPHP 时先调 site_service.sync_site_seeding_data(该站, plugin) 再对该站重新查。取 bonus_params、address_mappings，用 downloader_seed_service.list_downloader_candidates_for_site 得该站候选。对 pairs 用 Utils 算魔力、做 matched 判断，拼 row 与 downloader_candidates，汇总 total_*，返回站点块列表。 |
+| `build_seed_association_payload(plugin, override_config, site_id, keyword)` | 若有 override_config 临时覆盖 plugin 配置。调 get_bonus_seeding_data 得站点块；筛未匹配、按 site_fully_matched/selected_sites 过滤；downloader_torrents_by_site 用各块 downloader_candidates；为未匹配拼 options；按 site_id/keyword 组 right_table；finally 恢复 plugin 配置。返回 sites、downloader_torrents、downloader_torrents_by_site。 |
+| `apply_save_data(plugin, associations)` | 遍历 associations（前端传入的下载器种子对象列表，每项含 downloader_hash、site_seed_id 等）；通过 downloader_seed_mapper 的 upsert_downloader_seed 方法保存入库（对象含 site_seed_id 字段，不为空即带关联，为空即取消关联）。供 Controller.api_save_data 调用。 |
+| `sync_init_mappings_and_fully_matched(plugin, config)` | 从 config 解析 torrent_mapping_*，调 downloader_seed_mapper 的 list_all_mappings 得当前关联，将差异通过 upsert_downloader_seed 写回；再根据 get_bonus_seeding_data 的结果做自动匹配并写 PluginData 的 site_fully_matched。供 __init__.init_plugin 调用。 |
+
+### 4.5 `config_service.py` — 配置与选项
+
+| 方法 | 功能与逻辑 |
+|------|------------|
+| `get_form_options(plugin)` | 从主项目取已启用站点与下载器（SiteOper、ServiceConfigHelper），转为 title/value；从 plugin.site_address_mappings 汇总地址关键词经 Utils 包中的 keyword_to_domain 得 address_keyword_options；可算 suggested_site_mappings。返回 sites、downloaders、address_keyword_options、suggested_site_mappings 等。 |
+| `get_downloader_tracker_options(plugin, data)` | 从 data 解析下载器列表，用 utils/downloader_fetcher 拉取种子，从 tracker 提域名去重排序，返回 address_keyword_options。 |
+
+### 4.6 站点表与下载器表的数据更新时机
+
+- **站点表（SiteSeed / SiteSeedSnapshot）与 PluginData 中的 site_info_*、total_*、bonus_params_***  
+  - **站点刷新事件**：主项目在「刷新单站用户数据」或「刷新全部站点用户数据」后会发送 `SiteRefreshed` 事件，事件数据为 `event_data`（主项目 Event 类字段名为 `event_data`），其中 `site_id` 为单站 id 或 `"*"`。插件在 `trigger_sync_on_site_refresh(plugin, event)` 中读取 `event.event_data`（兼容 `event.data`）得到 `site_id`，若为单站则对该站调 `sync_site_seeding_data`，若为 `"*"` 则对当前已选站点中 NexusPHP 站点逐站调用 `sync_site_seeding_data`，从而拉取做种页、解析、写入站点种子表及 PluginData。  
+  - **请求做种明细时补拉**：`get_bonus_seeding_data` 中若某站查库无做种记录且该站为 NexusPHP，会先调 `site_service.sync_site_seeding_data(该站, plugin)` 再重新查库，因此打开做种页请求 bonus_data 时也会触发一次站点数据同步（仅限无数据且 NexusPHP 的站）。
+
+- **下载器表（DownloaderSeed / DownloaderSeedSnapshot）**  
+  - 下载器种子在以下时机写入插件表：(1) 用户在做种页点击保存关联时，`api_save_data` → `apply_save_data` 通过 downloader_seed_mapper 的 upsert_downloader_seed 保存；(2) 插件 init 时 `sync_init_mappings_and_fully_matched` 从配置中的 `torrent_mapping_*` 与当前关联对比后写入差异；(3) 调用 `downloader_seed_service.sync_downloader_seeds_from_api(plugin)` 时，从下载器 API 拉取种子并通过 Mapper 写入（已有关联的 site_seed_id 保留）。若需在打开做种页或定时触发拉取，在相应时机调用 `sync_downloader_seeds_from_api` 即可。
+
+---
+
+## 5. Mapper / Model / Utils
+
+Mapper、Model、Utils 为独立分层。**同步做种数据的流程在 site_service 内**（拉取 → 解析 → 写库/PluginData），site_service 调 utils（page_parser、fetch）与 site_seed_mapper；page_parser、downloader_fetcher 放在 utils 下。**对 DB 的持久化仅经 Mapper**；Model 为表映射对象，Mapper 在持久化时使用，Service 等可接收 Mapper 返回的 Model 并做只读或转换。主项目已有的能力由 Service 直接调主项目。
+
+### 5.1 `MVC/models/`
+
+仅放表的映射对象（ORM 实体），如 SiteSeed、SiteSeedSnapshot、DownloaderSeed、DownloaderSeedSnapshot；不写业务逻辑。**与 DB 的持久化由 Mapper 完成**；其它层可引用或接收 Mapper 返回的 Model 实例。
+
+- `site_seed.py`：SiteSeed、SiteSeedSnapshot。
+- `downloader_seed.py`：DownloaderSeed、DownloaderSeedSnapshot。
+- `__init__.py`：导出上述四类。
+
+### 5.2 `MVC/mappers/`
+
+仅负责插件四张表的数据访问（CRUD），不做业务拼装、不做魔力计算、不做 HTTP 请求。与主项目一致，Mapper 方法使用 `@db_update`（写操作）或 `@db_query`（读操作）装饰器，由装饰器注入 `db: Session`，Mapper 不自行创建 Session。
+
+**Mapper 方法设计原则**：
+
+| 类型 | 说明 | 设计原则 |
+|------|------|---------|
+| **DbOper 基类** | 继承获得 `self._db` | Mapper 继承 `app.db.DbOper`，获得 `__init__(db=None)` 与 `self._db`；`create/get/update/delete/list` 等在主项目 `app.db.Base`（Model 基类）上，Mapper 可按需调用 `Model.get(db, id)` 或自行实现业务方法 |
+| **特定业务查询** | 按需新增 | 高频业务查询新增独立方法，如 `get_downloader_seed_by_hash(self, db=None, downloader_hash=...)`，db 由装饰器注入 |
+| **复杂查询** | 灵活处理 | 低频或复杂条件可在 Service 层过滤，或按需在 Mapper 新增方法 |
+
+- **`seedinfo_db.py`** — 建表与迁移（仅此模块动 schema，不提供业务 CRUD）
+  - `init_seedinfo_db()`：创建或校验四张表存在，执行迁移（schema/表结构、字段默认值等）。内部自行创建 Session 完成建表与迁移。
+  - `_migrate_schema`、`_migrate_table`、`_normalize_downloader_state`：内部迁移与数据规范化。
+
+- **`site_seed_mapper.py`** / **`downloader_seed_mapper.py`** — 操作插件四张表
+  - 继承 `DbOper` 基类获得 `self._db`
+  - 按需新增业务方法；`downloader_seed_mapper` 已统一使用 `@db_update`（写）或 `@db_query`（读）装饰器，方法签名为 `(self, db=None, ...)`，db 由装饰器注入；`site_seed_mapper` 当前仍通过 `__init__(db)` 接收 db，后续可统一为装饰器模式
+
+### 5.3 `MVC/utils/`
+
+纯工具函数与可复用能力，不做业务编排；可按功能拆分为多个模块。**page_parser、downloader_fetcher 放在本目录下**，由 Service 调用。
+
+- **通用工具**（如 tracker、bonus、config、display 等）：`parse_tracker_domain`、`tracker_full_host`、`keyword_to_domain`、`tracker_domain_group_key`、`parse_pubdate_weeks`、`calc_bonus_per_hour`、`parse_list_config`、`torrent_key`、`display_width`、`truncate_by_display_width`、`name_match_at_least_n_tokens` 等。
+- **`page_parser.py`** — NexusPHP 页面解析，被 site_service 在 sync_site_seeding_data 流程中调用：`_prepare_html_text`、`parse_bonus_params_nexusphp`、`parse_torrent_activity_nexusphp`、`extract_userid_from_index_nexusphp`。
+- **`downloader_fetcher.py`**（可选）— 从下载器（qBittorrent/Transmission）拉取种子列表：`get_downloader_instance`、`fetch_downloader_torrents`、`fetch_downloader_torrents_by_domain`。被 config_service.get_downloader_tracker_options 调用。若插件内无此文件，则使用主项目或公共模块的下载器拉取接口。
+
+---
+
+## 6. View 层
+
+配置页与做种页由 Vue 组件渲染（Config.vue、Page.vue），数据通过 Controller 暴露的 API 获取与提交，不放在 `MVC/` 下。接口：/form_options、/downloader_tracker_options、/site_list、/bonus_data、/save_data。
+
+---
+
+## 7. 目录与调用关系
+
+```
+app/plugins/ptbonuscalc/
+├── __init__.py
+└── MVC/
+    ├── controller.py
+    ├── services/
+    │   ├── __init__.py
+    │   ├── init_service.py
+    │   ├── site_service.py
+    │   ├── downloader_seed_service.py
+    │   ├── bonus_service.py
+    │   └── config_service.py
+    ├── models/
+    │   ├── __init__.py
+    │   ├── site_seed.py
+    │   └── downloader_seed.py
+    ├── mappers/
+    │   ├── __init__.py
+    │   ├── seedinfo_db.py
+    │   ├── site_seed_mapper.py
+    │   └── downloader_seed_mapper.py
+    ├── utils/
+    │   ├── __init__.py
+    │   ├── page_parser.py
+    │   ├── downloader_fetcher.py（可选）
+    │   └── （若干工具模块，如 tracker.py、bonus.py 等）
+```
+
+__init__：API/事件经 get_api 绑定到 Controller；init 直接调 Service。Controller 只调 Service。Service 调主项目、Mapper、Utils；**同步做种数据流程在 site_service 内**，site_service 调 utils（page_parser、fetch）与 site_seed_mapper。**对 DB 的读写经 Mapper**，Mapper 通过装饰器使用注入的 db；downloader_seed_service 不持 db 只调 Mapper，bonus_service 等仍自行创建 Session 待统一；Service 可接收 Mapper 返回的 Model 并转换，但不绕过 Mapper 做持久化。
+
+---
+
+## 8. 与参考实现的差异
+
+原 `MVC结构说明.md` 与 `__init__ copy.py` 中业务集中在 Controller 或插件类内。本方案：插件命名为本地种子管理插件；后端代码放在 MVC/ 下；Controller 只有接口，init 直接调 Service；Service 为业务入口；**同步做种数据流程在 site_service 内**，page_parser、downloader_fetcher 放 utils 下；分层为 Entry → Controller → Service → Mapper → Model，Utils 跨层；**对 DB 的持久化仅经 Mapper**，Model 为表映射对象可被其它层接收使用；插件 Mapper 按职责拆为三模块（seedinfo_db、site_seed_mapper、downloader_seed_mapper），仅操作四张表，主项目按领域拆（如 SiteOper 只操作 Site 相关表），插件不重复主项目能力。

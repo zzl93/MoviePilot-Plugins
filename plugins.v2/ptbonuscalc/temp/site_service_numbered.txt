@@ -1,0 +1,206 @@
+   1: """
+   2: 站点数据：从主项目取站、写 PluginData、同步做种数据（拉取→解析→写表�?PluginData）�?
+   3: """
+   4: from typing import List, Optional, Any
+   5: from app.db import ScopedSession
+   6: from app.db.site_oper import SiteOper
+   7: from app.db.plugindata_oper import PluginDataOper
+   8: from app.helper.sites import SitesHelper
+   9: from app.plugins.ptbonuscalc.MVC.mappers.site_seed_mapper import SiteSeedMapper as SSM
+  10: from app.plugins.ptbonuscalc.MVC.utils import parse_torrent_activity_nexusphp
+  11: from app.utils.http import RequestUtils
+  12: import json
+  13: 
+  14: 
+  15: def _plugin_id(plugin) -> str:
+  16:     return getattr(plugin, "plugin_id", None) or type(plugin).__name__
+  17: 
+  18: 
+  19: def _selected_sites(plugin) -> List[int]:
+  20:     s = getattr(plugin, "selected_sites", None) or []
+  21:     return s if isinstance(s, list) else []
+  22: 
+  23: 
+  24: def get_sites_to_query(
+  25:     plugin,
+  26:     site_id: Optional[int] = None,
+  27:     filter_by_selected_sites: bool = True,
+  28: ) -> List[dict]:
+  29:     """若传 site_id 则从主项目站点表查该�?indexer 返回单元素列表；否则取主项目已启用站点并�?selected_sites 过滤�?""
+  30:     sites_helper = SitesHelper()
+  31:     if site_id is not None:
+  32:         site_oper = SiteOper()
+  33:         site = site_oper.get(site_id)
+  34:         if not site:
+  35:             return []
+  36:         indexer = sites_helper.get_indexer(site.domain)
+  37:         return [indexer] if indexer else []
+  38:     indexers = sites_helper.get_indexers() or []
+  39:     if not indexers:
+  40:         return []
+  41:     if filter_by_selected_sites:
+  42:         selected = _selected_sites(plugin)
+  43:         if selected:
+  44:             indexers = [x for x in indexers if x.get("id") in selected]
+  45:     return [x for x in indexers if x.get("is_active")]
+  46: 
+  47: 
+  48: def get_sites_from_plugindata(plugin, site_id: Optional[int] = None) -> List[dict]:
+  49:     """�?PluginData �?site_info_{domain}，可�?site_id 筛单站。返回项�?total_seed_count、total_bonus_per_hour、bonus_params、has_bonus_params 等�?""
+  50:     pid = _plugin_id(plugin)
+  51:     pdo = PluginDataOper()
+  52:     all_data = pdo.get_data_all(pid) or []
+  53:     site_infos = []
+  54:     filter_domain = None
+  55:     if site_id is not None:
+  56:         site_oper = SiteOper()
+  57:         site = site_oper.get(site_id)
+  58:         if site:
+  59:             filter_domain = site.domain
+  60:     for row in all_data:
+  61:         key = getattr(row, "key", None) or row.get("key") if isinstance(row, dict) else None
+  62:         if not key or not str(key).startswith("site_info_"):
+  63:             continue
+  64:         domain = str(key).replace("site_info_", "", 1)
+  65:         if filter_domain is not None and domain != filter_domain:
+  66:             continue
+  67:         val = getattr(row, "value", None) or (row.get("value") if isinstance(row, dict) else None)
+  68:         if isinstance(val, str):
+  69:             try:
+  70:                 val = json.loads(val)
+  71:             except Exception:
+  72:                 val = {}
+  73:         if not isinstance(val, dict):
+  74:             val = {}
+  75:         bonus_key = f"bonus_params_{domain}"
+  76:         bonus_raw = pdo.get_data(pid, bonus_key)
+  77:         if isinstance(bonus_raw, str):
+  78:             try:
+  79:                 bonus_params = json.loads(bonus_raw)
+  80:             except Exception:
+  81:                 bonus_params = {}
+  82:         else:
+  83:             bonus_params = bonus_raw or {}
+  84:         val["bonus_params"] = bonus_params
+  85:         val["has_bonus_params"] = bool(bonus_params)
+  86:         site_infos.append(val)
+  87:     return site_infos
+  88: 
+  89: 
+  90: def write_site_infos_for_selected(plugin) -> None:
+  91:     """�?selected_sites 从主项目取各�?indexer，写�?PluginData �?site_info_{domain}，并合并已存�?total_*�?""
+  92:     pid = _plugin_id(plugin)
+  93:     pdo = PluginDataOper()
+  94:     sites = get_sites_to_query(plugin, filter_by_selected_sites=True)
+  95:     for indexer in sites:
+  96:         domain = (indexer.get("domain") or "").strip()
+  97:         if not domain:
+  98:             continue
+  99:         key = f"site_info_{domain}"
+ 100:         existing = pdo.get_data(pid, key)
+ 101:         if isinstance(existing, str):
+ 102:             try:
+ 103:                 existing = json.loads(existing)
+ 104:             except Exception:
+ 105:                 existing = {}
+ 106:         if not isinstance(existing, dict):
+ 107:             existing = {}
+ 108:         info = {
+ 109:             "id": indexer.get("id"),
+ 110:             "name": indexer.get("name"),
+ 111:             "domain": domain,
+ 112:             "url": indexer.get("domain"),
+ 113:             "schema": indexer.get("parser") or "NexusPHP",
+ 114:         }
+ 115:         info["total_seed_count"] = existing.get("total_seed_count")
+ 116:         info["total_bonus_per_hour"] = existing.get("total_bonus_per_hour")
+ 117:         pdo.save(pid, key, info)
+ 118: 
+ 119: 
+ 120: def sync_site_seeding_data(site: dict, plugin) -> None:
+ 121:     """从站点拉取做种数据的完整流程：发 HTTP 请求拉取做种页与 mybonus �?解析 �?写站点种子表 �?�?更新 PluginData�?""
+ 122:     pid = _plugin_id(plugin)
+ 123:     site_id = site.get("id")
+ 124:     domain = site.get("domain") or site.get("url") or ""
+ 125:     if not domain or site_id is None:
+ 126:         return
+ 127:     schema = (site.get("schema") or site.get("parser") or "").lower()
+ 128:     if "nexusphp" not in schema and "nexus" not in schema:
+ 129:         return
+ 130:     base_url = domain.rstrip("/")
+ 131:     cookie = site.get("cookie")
+ 132:     ua = site.get("ua") or site.get("user_agent")
+ 133:     headers = {"User-Agent": ua} if ua else {}
+ 134:     # 拉取做种页（简化：使用 getusertorrentlistajax �?torrents.php?type=seeding�?
+ 135:     seeding_url = f"{base_url}/getusertorrentlistajax.php?type=seeding"
+ 136:     try:
+ 137:         res = RequestUtils(cookies=cookie, headers=headers, timeout=30).get_res(seeding_url)
+ 138:         html = (res.text if res and res.status_code == 200 else "") or ""
+ 139:     except Exception:
+ 140:         html = ""
+ 141:     if not html.strip():
+ 142:         try:
+ 143:             res = RequestUtils(cookies=cookie, headers=headers, timeout=30).get_res(f"{base_url}/torrents.php?type=seeding")
+ 144:             html = (res.text if res and res.status_code == 200 else "") or ""
+ 145:         except Exception:
+ 146:             pass
+ 147:     parser_result = parse_torrent_activity_nexusphp(html)
+ 148:     db = ScopedSession()
+ 149:     try:
+ 150:         mapper = SSM(db)
+ 151:         mapper.batch_save_seeding_from_parser(site_id, parser_result)
+ 152:         db.commit()
+ 153:     except Exception:
+ 154:         db.rollback()
+ 155:         raise
+ 156:     finally:
+ 157:         db.close()
+ 158:     total_seed_count = len(parser_result.get("torrents") or [])
+ 159:     total_bonus_per_hour = sum((t.get("bonus_per_hour") or 0) for t in (parser_result.get("torrents") or []))
+ 160:     key = f"site_info_{domain}"
+ 161:     pdo = PluginDataOper()
+ 162:     existing = pdo.get_data(pid, key)
+ 163:     if isinstance(existing, str):
+ 164:         try:
+ 165:             existing = json.loads(existing)
+ 166:         except Exception:
+ 167:             existing = {}
+ 168:     if not isinstance(existing, dict):
+ 169:         existing = {}
+ 170:     existing["total_seed_count"] = total_seed_count
+ 171:     existing["total_bonus_per_hour"] = round(total_bonus_per_hour, 2)
+ 172:     existing["name"] = existing.get("name") or site.get("name")
+ 173:     existing["domain"] = domain
+ 174:     pdo.save(pid, key, existing)
+ 175:     bonus_params = parser_result.get("bonus_params")
+ 176:     if bonus_params is not None:
+ 177:         pdo.save(pid, f"bonus_params_{domain}", bonus_params)
+ 178: 
+ 179: 
+ 180: def trigger_sync_on_site_refresh(plugin, event) -> None:
+ 181:     """根据 event 得到 site_id，从主项目取对应站点信息，若�?NexusPHP 则调 sync_site_seeding_data。site_id �?'*' 时对已选站点逐站同步�?""
+ 182:     site_id = None
+ 183:     payload = getattr(event, "event_data", None) or getattr(event, "data", None)
+ 184:     if isinstance(payload, dict):
+ 185:         site_id = payload.get("site_id") or payload.get("id")
+ 186:     if site_id is None:
+ 187:         return
+ 188:     sites_helper = SitesHelper()
+ 189:     site_oper = SiteOper()
+ 190:     if site_id == "*":
+ 191:         indexers = get_sites_to_query(plugin, site_id=None, filter_by_selected_sites=True)
+ 192:         for indexer in indexers:
+ 193:             schema = (indexer.get("parser") or "").lower()
+ 194:             if "nexusphp" in schema or "nexus" in schema:
+ 195:                 sync_site_seeding_data(indexer, plugin)
+ 196:         return
+ 197:     site = site_oper.get(site_id)
+ 198:     if not site:
+ 199:         return
+ 200:     indexer = sites_helper.get_indexer(site.domain)
+ 201:     if not indexer:
+ 202:         return
+ 203:     schema = (indexer.get("parser") or "").lower()
+ 204:     if "nexusphp" not in schema and "nexus" not in schema:
+ 205:         return
+ 206:     sync_site_seeding_data(indexer, plugin)

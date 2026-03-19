@@ -1,0 +1,19 @@
+{
+  "domains": ["pttime.org", "pttime.wiki", "www.pttime.org", "www.pttime.wiki"],
+  "table_selectors": [
+    "//table[@class='torrents']",
+    "//table[.//td[@class='colhead' and contains(., '在做种')]]",
+    "//table[.//td[@class='colhead' and contains(., '大小')]]"
+  ],
+  "column_keywords": {
+    "size": ["大小", "size"],
+    "seeders": ["在做种", "种子", "seeders", "做种"],
+    "leechers": ["下载中", "下载", "leechers"],
+    "publish_time": ["发布时间", "发表", "published"],
+    "seed_time": ["做种时间", "下载时间", "seeding time", "完成时间"]
+  },
+  "torrent_id_sources": [
+    {"xpath": ".//a[contains(@href,'details.php')]/@href", "regex": "(?:id|torrentid)=(\\d+)"}
+  ],
+  "name_xpath": ".//a[contains(@href,'details.php')]"
+}
