@@ -1,16 +1,35 @@
 {
-  "domains": ["pttime.org", "pttime.wiki", "www.pttime.org", "www.pttime.wiki"],
+  "domains": ["pttime.wiki", "pttime.org", "www.pttime.wiki", "www.pttime.org"],
+  "bonus_params": {},
   "table_selectors": [
-    "//table[@class='torrents']",
     "//table[.//td[@class='colhead' and contains(., '在做种')]]",
-    "//table[.//td[@class='colhead' and contains(., '大小')]]"
+    "//table[contains(@class,'torrents') and .//td[@class='colhead']]"
   ],
   "column_keywords": {
-    "size": ["大小", "size"],
-    "seeders": ["在做种", "种子", "seeders", "做种"],
-    "leechers": ["下载中", "下载", "leechers"],
-    "publish_time": ["发布时间", "发表", "published"],
-    "seed_time": ["做种时间", "下载时间", "seeding time", "完成时间"]
+    "type": ["类型"],
+    "title": ["标题"],
+    "size": ["大小"],
+    "publish_time": ["发布时间"],
+    "seeders": ["在做种"],
+    "leechers": ["下载中"],
+    "completed": ["已完成"],
+    "ratio": ["分享率"],
+    "download_time": ["下载时间"],
+    "uploader": ["发布者"],
+    "action": ["操作"]
+  },
+  "column_parse_types": {
+    "size": "size",
+    "seeders": "int",
+    "leechers": "int",
+    "completed": "int",
+    "ratio": "raw",
+    "publish_time": "raw",
+    "download_time": "raw",
+    "type": "raw",
+    "title": "raw",
+    "uploader": "raw",
+    "action": "raw"
   },
   "torrent_id_sources": [
     {"xpath": ".//a[contains(@href,'details.php')]/@href", "regex": "(?:id|torrentid)=(\\d+)"}

@@ -10,6 +10,7 @@ from app.log import logger
 
 _CONFIG_DIR = Path(__file__).resolve().parent.parent.parent / "site_configs"
 _CACHE: Dict[str, Dict] = {}
+_CONFIG_FILE_MAP: Dict[str, Path] = {}
 _DEFAULT_CONFIG: Optional[Dict] = None
 
 
@@ -23,9 +24,10 @@ def _load_json(path: Path) -> Optional[Dict]:
 
 
 def _load_all_configs() -> None:
-    global _CACHE, _DEFAULT_CONFIG
+    global _CACHE, _CONFIG_FILE_MAP, _DEFAULT_CONFIG
     if _CACHE:
         return
+    _CONFIG_FILE_MAP.clear()
     if not _CONFIG_DIR.exists():
         _DEFAULT_CONFIG = {}
         return
@@ -40,6 +42,7 @@ def _load_all_configs() -> None:
             key = str(d).lower().strip()
             if key and key not in _CACHE:
                 _CACHE[key] = cfg
+                _CONFIG_FILE_MAP[key] = p
     if _DEFAULT_CONFIG is None:
         _DEFAULT_CONFIG = _load_json(_CONFIG_DIR / "default.json") or {}
 
@@ -65,13 +68,42 @@ def _domain_to_keys(domain: str) -> list:
     return keys
 
 
-def get_site_parser_config(domain: str) -> Dict[str, Any]:
-    """根据站点 domain 返回解析配置，无匹配时返回 default 配置。"""
+def get_site_parser_config(domain: str) -> tuple:
+    """根据站点 domain 返回 (解析配置, 是否有专属配置)。无匹配时返回 (default配置, False)。"""
     _load_all_configs()
     for key in _domain_to_keys(domain):
         if key in _CACHE:
-            return dict(_CACHE[key])
+            return (dict(_CACHE[key]), True)
+    d = (domain or "").lower()
     for loaded_key, cfg in _CACHE.items():
-        if loaded_key in domain or domain.endswith(loaded_key):
-            return dict(cfg)
-    return dict(_DEFAULT_CONFIG or {})
+        if loaded_key in d or d.endswith(loaded_key):
+            return (dict(cfg), True)
+    return (dict(_DEFAULT_CONFIG or {}), False)
+
+
+def save_bonus_params_for_domain(domain: str, bonus_params: dict) -> bool:
+    """
+    将 bonus_params 写入该 domain 对应的站点配置 json 文件。仅当 domain 有专属配置时写入。
+    写入后清除缓存，使后续读取生效。返回是否成功写入。
+    """
+    global _CACHE, _CONFIG_FILE_MAP
+    if not bonus_params or not isinstance(bonus_params, dict):
+        return False
+    _load_all_configs()
+    for key in _domain_to_keys(domain):
+        if key in _CONFIG_FILE_MAP:
+            path = _CONFIG_FILE_MAP[key]
+            try:
+                cfg = _load_json(path) or {}
+                cfg["bonus_params"] = dict(bonus_params)
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(cfg, f, ensure_ascii=False, indent=2)
+                for k, p in _CONFIG_FILE_MAP.items():
+                    if p == path:
+                        _CACHE[k] = cfg
+                logger.info(f"[ptbonuscalc] 已将 bonus_params 写入 {path.name} domain={key}")
+                return True
+            except Exception as e:
+                logger.warning(f"[ptbonuscalc] 写入 bonus_params 到 {path} 失败: {e}")
+                return False
+    return False

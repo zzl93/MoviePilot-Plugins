@@ -1,5 +1,6 @@
 {
   "domains": [],
+  "bonus_params": {},
   "table_selectors": [
     "//table[.//td[@class='colhead' and (contains(., '做种时间') or contains(., '在做种'))]]",
     "//table[.//img[@class=\"size\" or @alt=\"size\" or @title=\"size\"]]",
@@ -12,7 +13,20 @@
     "publish_time": ["发布时间", "发表", "published", "time"],
     "seed_time": ["做种时间", "seeding time"],
     "weight": ["权重", "weight"],
-    "client": ["客户端", "client"]
+    "client": ["客户端", "client"],
+    "upload": ["上传", "upload", "ul", "上传量"],
+    "download": ["下载", "download", "dl", "下载量"]
+  },
+  "column_parse_types": {
+    "size": "size",
+    "upload": "size",
+    "download": "size",
+    "seed_time": "duration",
+    "seeders": "int",
+    "leechers": "int",
+    "weight": "float",
+    "publish_time": "raw",
+    "client": "raw"
   },
   "torrent_id_sources": [
     {"xpath": ".//a[contains(@href,'details.php') or contains(@href,'torrents.php')]/@href", "regex": "(?:id|torrentid)=(\\d+)"}

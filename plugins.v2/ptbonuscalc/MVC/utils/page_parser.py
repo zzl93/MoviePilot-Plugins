@@ -17,6 +17,8 @@ _PUBLISH_TIME_KEYWORDS = ["发布时间", "发表", "published", "time"]
 _SEED_TIME_KEYWORDS = ["做种时间", "seeding time"]
 _WEIGHT_KEYWORDS = ["权重", "weight"]
 _CLIENT_KEYWORDS = ["客户端", "client"]
+_UPLOAD_KEYWORDS = ["上传", "upload", "ul", "上传量"]
+_DOWNLOAD_KEYWORDS = ["下载", "download", "dl", "下载量"]
 
 
 def _get_column_keywords(config: Dict, field: str) -> List[str]:
@@ -32,6 +34,8 @@ def _get_column_keywords(config: Dict, field: str) -> List[str]:
         "seed_time": _SEED_TIME_KEYWORDS,
         "weight": _WEIGHT_KEYWORDS,
         "client": _CLIENT_KEYWORDS,
+        "upload": _UPLOAD_KEYWORDS,
+        "download": _DOWNLOAD_KEYWORDS,
     }
     return defaults.get(field, [])
 
@@ -66,14 +70,31 @@ def _prepare_html_text(html_text: str) -> str:
 
 
 def _get_table_element(html) -> Optional[etree._Element]:
-    """返回包含做种表格的 table 元素。"""
+    """返回包含做种表格的 table 元素，排除筛选/侧边栏等非种子列表表。"""
     tables = html.xpath('//table[.//img[@class="size" or @alt="size" or @title="size"]]')
     if tables:
         return tables[0]
     tables = html.xpath('//table[.//td[contains(translate(normalize-space(string(.)), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "seeders")]]')
     if tables:
         return tables[0]
-    return html.xpath("//table")[0] if html.xpath("//table") else None
+    tables = html.xpath('//table[.//th[contains(translate(normalize-space(string(.)), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "seeders")]]')
+    if tables:
+        return tables[0]
+    all_tables = html.xpath("//table")
+    if not all_tables:
+        return None
+    best = None
+    best_rows = 0
+    for tb in all_tables:
+        rows = tb.xpath(".//tr[position()>1]")
+        if len(rows) < 2:
+            continue
+        links = " ".join(tb.xpath(".//a/@href"))
+        if "details.php" in links or "torrents.php" in links:
+            if len(rows) > best_rows:
+                best_rows = len(rows)
+                best = tb
+    return best if best is not None else all_tables[0]
 
 
 def _collect_header_cells(table: etree._Element) -> List[etree._Element]:
@@ -99,6 +120,45 @@ def _find_column_index(headers: List[etree._Element], keywords: List[str]) -> Op
         if any(kw and kw in text for kw in keywords):
             return idx
     return None
+
+
+def _normalize_header_key(text: str) -> str:
+    """将表头文本规范化为 extra 的 key，避免非法字符。"""
+    if not text:
+        return "col"
+    s = re.sub(r"\s+", "_", text.strip())
+    s = re.sub(r"[^\w\u4e00-\u9fff\-_]", "", s)
+    return s[:60] if s else "col"
+
+
+def _build_all_header_spec(headers: List[etree._Element], config: Dict) -> List[tuple]:
+    """
+    遍历所有表头，返回 [(col_index, key, parse_type), ...]。
+    表头定义来自 config.column_keywords（字段名->表头关键词）和 config.column_parse_types（字段名->解析类型）。
+    """
+    kw = config or {}
+    column_keywords = kw.get("column_keywords") or {}
+    column_parse_types = kw.get("column_parse_types") or {}
+    _default_parse = {"size": "size", "upload": "size", "download": "size", "seed_time": "duration",
+                      "seeders": "int", "leechers": "int", "weight": "float"}
+    spec = []
+    for idx, cell in enumerate(headers, start=1):
+        text = _header_text(cell).replace("\n", " ").strip()
+        key = None
+        parse_type = "raw"
+        for field, keywords in column_keywords.items():
+            if not keywords or not isinstance(keywords, list):
+                continue
+            lowered = [k.lower() for k in keywords if k]
+            lowered_text = text.lower()
+            if any(k and k in lowered_text for k in lowered):
+                key = field
+                parse_type = column_parse_types.get(field) or _default_parse.get(field, "raw")
+                break
+        if key is None:
+            key = _normalize_header_key(text) or f"col_{idx}"
+        spec.append((idx, key, parse_type))
+    return spec
 
 
 def _parse_duration_to_seconds(text: Optional[str]) -> int:
@@ -181,6 +241,9 @@ def parse_bonus_params_nexusphp(html_text: str) -> Dict[str, Any]:
     return params
 
 
+_ID_REGEX = re.compile(r"[?&]id=(\d+)")
+
+
 def _extract_torrent_id_from_row(row: etree._Element, config: Dict) -> tuple:
     """从行中按配置的 torrent_id_sources 提取 torrent_id 与 detail_path。返回 (torrent_id, detail_path)。"""
     torrent_id = ""
@@ -210,6 +273,17 @@ def _extract_torrent_id_from_row(row: etree._Element, config: Dict) -> tuple:
                         return (torrent_id, detail_path or text)
         except Exception:
             continue
+    if not torrent_id:
+        try:
+            hrefs = row.xpath('.//a[contains(@href,"details.php") or contains(@href,"torrents.php")]/@href')
+            for href in (hrefs if isinstance(hrefs, list) else [hrefs]):
+                if not href:
+                    continue
+                m = _ID_REGEX.search(str(href))
+                if m and m.group(1).isdigit():
+                    return (m.group(1), str(href).strip())
+        except Exception:
+            pass
     return (torrent_id, detail_path)
 
 
@@ -242,80 +316,81 @@ def parse_torrent_activity_with_config(html_text: str, config: Dict) -> Dict[str
     if table is None:
         logger.warning("[ptbonuscalc] parse_torrent_activity 未找到做种表")
         return result
+    table_selectors = (config or {}).get("table_selectors") or []
+    logger.info(f"[ptbonuscalc] parse_torrent_activity 使用配置 table_selectors 数量={len(table_selectors)}")
     headers = _collect_header_cells(table)
     kw = config or {}
-    size_col = _find_column_index(headers, _get_column_keywords(kw, "size")) or 3
-    seeders_col = _find_column_index(headers, _get_column_keywords(kw, "seeders")) or 4
-    leechers_col = _find_column_index(headers, _get_column_keywords(kw, "leechers"))
-    publish_col = _find_column_index(headers, _get_column_keywords(kw, "publish_time"))
-    seed_time_col = _find_column_index(headers, _get_column_keywords(kw, "seed_time"))
-    weight_col = _find_column_index(headers, _get_column_keywords(kw, "weight"))
-    client_col = _find_column_index(headers, _get_column_keywords(kw, "client"))
+    header_spec = _build_all_header_spec(headers, kw)
     rows = table.xpath(".//tr[position()>1]")
     all_tr = table.xpath(".//tr")
     logger.info(
-        f"[ptbonuscalc] parse_torrent_activity 表头列 size={size_col} seeders={seeders_col} seed_time={seed_time_col} "
-        f"总tr={len(all_tr)} 数据行(除表头)={len(rows)}"
+        f"[ptbonuscalc] parse_torrent_activity 表头数={len(header_spec)} 列 keys={[s[1] for s in header_spec]} "
+        f"总tr={len(all_tr)} 数据行={len(rows)}"
     )
     for row in rows:
         cells = row.xpath("./td")
         if not cells:
             continue
-        size_text = cells[size_col - 1].xpath("string(.)").strip() if size_col and size_col <= len(cells) else ""
-        size_bytes = StringUtils.num_filesize(size_text)
-        seeders_text = cells[seeders_col - 1].xpath("string(.)").strip() if seeders_col and seeders_col <= len(cells) else ""
-        seeders = StringUtils.str_int(seeders_text)
-        leechers = 0
-        if leechers_col and leechers_col <= len(cells):
-            leechers_text = cells[leechers_col - 1].xpath("string(.)").strip()
-            leechers = StringUtils.str_int(leechers_text)
-        pubdate = ""
-        if publish_col and publish_col <= len(cells):
-            pubdate_raw = cells[publish_col - 1].xpath("string(.)").strip()
-            pubdate = pubdate_raw.replace("\xa0", " ")
+        extra = {}
+        size_bytes = 0
         seed_time_seconds = 0
-        seed_time_text = ""
-        if seed_time_col and seed_time_col <= len(cells):
-            seed_time_text = cells[seed_time_col - 1].xpath("string(.)").strip()
-            seed_time_seconds = _parse_duration_to_seconds(seed_time_text)
-        weight = None
-        if weight_col and weight_col <= len(cells):
-            weight_text = cells[weight_col - 1].xpath("string(.)").strip()
-            try:
-                weight = float(weight_text)
-            except ValueError:
-                if "0.2" in weight_text:
-                    weight = 0.2
-        client = ""
-        if client_col and client_col <= len(cells):
-            client = cells[client_col - 1].xpath("string(.)").strip()
+        for col_idx, key, parse_type in header_spec:
+            if col_idx > len(cells):
+                continue
+            raw = cells[col_idx - 1].xpath("string(.)")
+            raw = (str(raw).strip().replace("\xa0", " ") if raw is not None and raw else "") or ""
+            if parse_type == "size":
+                val = StringUtils.num_filesize(raw)
+                extra[key] = val
+                if key == "size":
+                    size_bytes = val
+            elif parse_type == "duration":
+                val = _parse_duration_to_seconds(raw)
+                extra[key] = val
+                extra[f"{key}_text"] = raw
+                if key == "seed_time":
+                    seed_time_seconds = val
+            elif parse_type == "int":
+                val = StringUtils.str_int(raw)
+                extra[key] = val
+            elif parse_type == "float":
+                try:
+                    val = float(raw)
+                except ValueError:
+                    val = 0.2 if "0.2" in raw else None
+                extra[key] = val
+            else:
+                extra[key] = raw
         torrent_id, detail_path = _extract_torrent_id_from_row(row, kw)
+        if not torrent_id or not str(torrent_id).isdigit():
+            if len(result["torrents"]) < 5:
+                first_cell = cells[0].xpath("string(.)").strip()[:30] if cells else ""
+                logger.info(
+                    f"[ptbonuscalc] parse_torrent_activity 跳过行 首列={repr(first_cell)}"
+                )
+            continue
         name = _extract_name_from_row(row, kw, cells)
-        if not torrent_id and len(result["torrents"]) < 3:
-            row_links = row.xpath(".//a/@href")
-            logger.info(f"[ptbonuscalc] parse_torrent_activity 前几行链接样例(无有效torrent_id): {row_links[:8]}")
+        extra["detail_path"] = detail_path
         torrent_entry = {
             "torrent_id": torrent_id,
-            "id": torrent_id or name,
+            "id": torrent_id,
             "name": name,
             "size": size_bytes,
             "seed_time": seed_time_seconds,
             "bonus_per_hour": 0.0,
-            "extra": {
-                "seeders": seeders,
-                "leechers": leechers,
-                "pubdate": pubdate,
-                "seed_time_text": seed_time_text,
-                "weight": weight,
-                "client": client,
-                "detail_path": detail_path,
-            },
+            "extra": extra,
         }
         result["torrents"].append(torrent_entry)
-    with_tid = sum(1 for t in result["torrents"] if t.get("torrent_id"))
-    if result["torrents"] and with_tid == 0:
+    valid_cnt = len(result["torrents"])
+    if valid_cnt > 0:
+        sample_ids = [t.get("torrent_id") for t in result["torrents"][:5]]
+        logger.info(
+            f"[ptbonuscalc] parse_torrent_activity 解析完成 有效行={valid_cnt} 总数据行={len(rows)} "
+            f"通过率={valid_cnt}/{len(rows) if rows else 0} 前5个torrent_id={sample_ids}"
+        )
+    elif rows:
         logger.warning(
-            f"[ptbonuscalc] parse_torrent_activity 解析到 {len(result['torrents'])} 行但无有效 torrent_id"
+            f"[ptbonuscalc] parse_torrent_activity 解析到 {len(rows)} 数据行但无有效 torrent_id"
         )
     return result
 
@@ -325,8 +400,37 @@ def parse_torrent_activity_nexusphp(html_text: str, site_config: Optional[Dict] 
     if site_config is not None:
         return parse_torrent_activity_with_config(html_text, site_config or {})
     from app.plugins.ptbonuscalc.MVC.utils.site_config_loader import get_site_parser_config
-    default_cfg = get_site_parser_config("")
+    default_cfg, _ = get_site_parser_config("")
     return parse_torrent_activity_with_config(html_text, default_cfg)
+
+
+def extract_next_seeding_page_url(html_text: str, base_url: str, current_url: str = "") -> Optional[str]:
+    """从做种页 HTML 解析下一页链接，返回完整 URL 或 None。仅接受含 getusertorrentlistajax 的链接，插件只请求该页面。"""
+    from urllib.parse import urljoin
+    if not html_text or not base_url:
+        return None
+    html_text = _prepare_html_text(html_text)
+    html = etree.HTML(html_text.replace(r"\/", "/"))
+    if html is None:
+        return None
+    base = base_url.rstrip("/")
+    referer = current_url or f"{base}/torrents.php?type=seeding"
+    next_hrefs = html.xpath(
+        '//a[contains(., "下一页") or contains(., "下一頁") or contains(., ">") or contains(., "›")]/@href'
+    )
+    for href in (next_hrefs or []):
+        if not href or "details.php" in str(href):
+            continue
+        href = str(href).strip()
+        if not href or href.startswith("#"):
+            continue
+        full = urljoin(referer, href) if not href.startswith("http") else href
+        if "getusertorrentlistajax" not in full:
+            continue
+        if full == current_url:
+            continue
+        return full
+    return None
 
 
 def extract_userid_from_index_nexusphp(html_text: str) -> Optional[str]:

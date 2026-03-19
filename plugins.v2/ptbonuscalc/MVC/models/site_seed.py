@@ -17,6 +17,7 @@ class SiteSeed(Base):
     torrent_id = Column(String, nullable=False, index=True)  # 站点内种子 ID
     name = Column(String)
     info_hash = Column(String, index=True)  # 可选，站点若提供则存
+    bonus_per_hour = Column(Float, default=0.0)  # 每小时魔力（最新快照值）
     created_at = Column(String, default=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     updated_at = Column(String, default=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
@@ -35,7 +36,6 @@ class SiteSeedSnapshot(Base):
     size = Column(BigInteger, default=0)  # 体积 bytes
     seed_time = Column(BigInteger, default=0)  # 做种时长 秒
     bonus_per_hour = Column(Float, default=0.0)  # 每小时魔力
-    bonus_params = Column(JSON)  # 站点魔力参数快照
-    extra = Column(JSON)  # 其它扩展字段
+    extra = Column(JSON)  # 其它扩展字段（含 upload、download、seeders、weight 等）
 
     site_seed = relationship("SiteSeed", back_populates="snapshots")

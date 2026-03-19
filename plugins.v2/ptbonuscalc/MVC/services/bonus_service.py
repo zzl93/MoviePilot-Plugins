@@ -23,16 +23,19 @@ def get_bonus_seeding_data(
     if use_plugindata_only:
         sites = site_service.get_sites_from_plugindata(plugin, site_id=site_id)
     else:
+        from app.plugins.ptbonuscalc.MVC.utils.site_config_loader import get_site_parser_config
         indexers = site_service.get_sites_to_query(plugin, site_id=site_id)
         sites = []
         for idx in indexers:
             domain = idx.get("domain") or ""
+            site_config, _ = get_site_parser_config(domain)
+            bonus_params = (site_config or {}).get("bonus_params") or {}
             site_block = {
                 "id": idx.get("id"),
                 "name": idx.get("name"),
                 "domain": domain,
                 "schema": idx.get("parser") or "NexusPHP",
-                "bonus_params": {},
+                "bonus_params": bonus_params if isinstance(bonus_params, dict) else {},
                 "address_mappings": (getattr(plugin, "site_address_mappings", None) or {}).get(domain) or [],
             }
             sites.append(site_block)
@@ -95,13 +98,17 @@ def build_seed_association_payload(
     site_id: Optional[int] = None,
     keyword: Optional[str] = None,
 ) -> dict:
-    """若有 override_config 临时覆盖 plugin 配置。调 get_bonus_seeding_data；筛未匹配、按 site_fully_matched/selected_sites 过滤；拼 options、right_table。返回 sites、downloader_torrents、downloader_torrents_by_site。"""
+    """若有 override_config 临时覆盖 plugin 配置。先实时同步做种数据，再调 get_bonus_seeding_data。"""
     saved = {}
     if override_config:
         for k, v in override_config.items():
             saved[k] = getattr(plugin, k, None)
             setattr(plugin, k, v)
     try:
+        from types import SimpleNamespace
+        sync_site_id = site_id if site_id is not None else "*"
+        ev = SimpleNamespace(event_data={"site_id": sync_site_id}, data={"site_id": sync_site_id})
+        site_service.trigger_sync_on_site_refresh(plugin, ev)
         downloader_seed_service.sync_downloader_seeds_from_api(plugin)
         blocks = get_bonus_seeding_data(plugin, site_id=site_id, use_plugindata_only=False)
     finally:

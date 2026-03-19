@@ -69,7 +69,7 @@ def _required_columns_for_table(table_name: str):
     if table_name == "ptbonuscalc_downloader_seed_snapshot":
         return ["id", "downloader_seed_id", "snapshot_at", "total_size"]
     if table_name == "ptbonuscalc_site_seed":
-        return ["id", "site_id", "torrent_id"]
+        return ["id", "site_id", "torrent_id", "bonus_per_hour"]
     if table_name == "ptbonuscalc_site_seed_snapshot":
         return ["id", "site_seed_id", "snapshot_at", "size"]
     return []

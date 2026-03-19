@@ -42,7 +42,6 @@ class PTBonusCalc(_PluginBase):
         from app.plugins.ptbonuscalc.MVC.services import init_service, site_service, bonus_service
         try:
             init_service.init_plugin_db(self)
-            site_service.write_site_infos_for_selected(self)
             bonus_service.sync_init_mappings_and_fully_matched(self, config)
         except Exception as e:
             import traceback

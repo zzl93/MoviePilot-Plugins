@@ -26,26 +26,28 @@ class SiteSeedMapper(DbOper):
         session = db or self._db
         snapshot_at = snapshot_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         torrents = (parser_result or {}).get("torrents") or []
-        bonus_params = (parser_result or {}).get("bonus_params")
 
         for t in torrents:
-            torrent_id = str(t.get("torrent_id") or t.get("id") or "")
-            if not torrent_id:
+            torrent_id = str(t.get("torrent_id") or "")
+            if not torrent_id or not torrent_id.isdigit():
                 continue
             seed = session.query(SiteSeed).filter(
                 and_(SiteSeed.site_id == site_id, SiteSeed.torrent_id == torrent_id)
             ).first()
+            bp = t.get("bonus_per_hour") or 0.0
             if not seed:
                 seed = SiteSeed(
                     site_id=site_id,
                     torrent_id=torrent_id,
                     name=t.get("name"),
                     info_hash=t.get("info_hash"),
+                    bonus_per_hour=bp,
                 )
                 session.add(seed)
                 session.flush()
             else:
                 seed.updated_at = snapshot_at
+                seed.bonus_per_hour = bp
                 if t.get("name") is not None:
                     seed.name = t.get("name")
                 if t.get("info_hash") is not None:
@@ -57,7 +59,6 @@ class SiteSeedMapper(DbOper):
                 size=t.get("size") or 0,
                 seed_time=t.get("seed_time") or 0,
                 bonus_per_hour=t.get("bonus_per_hour") or 0.0,
-                bonus_params=bonus_params or t.get("bonus_params"),
                 extra=t.get("extra"),
             )
             session.add(snap)
@@ -126,16 +127,6 @@ class SiteSeedMapper(DbOper):
             "downloader_snapshot": down_snap,
         }
 
-    @db_update
-    def delete_seed_info_by_site(self, db: Session = None, site_id: int = 0) -> None:
-        """删除指定站点下的全部 SiteSeed 及快照。"""
-        session = db or self._db
-        seeds = session.query(SiteSeed).filter(SiteSeed.site_id == site_id).all()
-        for s in seeds:
-            session.query(SiteSeedSnapshot).filter(SiteSeedSnapshot.site_seed_id == s.id).delete()
-            session.delete(s)
-        session.flush()
-
     @db_query
     def get_site_seed(self, db: Session = None, site_seed_id: int = 0) -> Optional[SiteSeed]:
         """按主键获取单条 SiteSeed。"""
@@ -168,16 +159,19 @@ class SiteSeedMapper(DbOper):
         seed = session.query(SiteSeed).filter(
             and_(SiteSeed.site_id == site_id, SiteSeed.torrent_id == torrent_id)
         ).first()
+        bp = (snapshot_data or {}).get("bonus_per_hour", 0.0)
         if not seed:
             seed = SiteSeed(
                 site_id=site_id,
                 torrent_id=torrent_id,
                 name=name,
                 info_hash=info_hash,
+                bonus_per_hour=bp,
             )
             session.add(seed)
             session.flush()
         else:
+            seed.bonus_per_hour = bp
             if name is not None:
                 seed.name = name
             if info_hash is not None:
@@ -191,7 +185,6 @@ class SiteSeedMapper(DbOper):
             size=snapshot_data.get("size", 0),
             seed_time=snapshot_data.get("seed_time", 0),
             bonus_per_hour=snapshot_data.get("bonus_per_hour", 0.0),
-            bonus_params=snapshot_data.get("bonus_params"),
             extra=snapshot_data.get("extra"),
         )
         session.add(snap)

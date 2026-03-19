@@ -1,22 +1,59 @@
 {
-  "domains": ["lajidui.top", "pt.lajidui.top"],
+  "domains": [
+    "lajidui.top",
+    "pt.lajidui.top"
+  ],
+  "bonus_params": {
+    "T0": 4,
+    "N0": 7,
+    "B0": 200,
+    "L": 300
+  },
   "table_selectors": [
     "//table[.//td[@class='colhead' and contains(., '做种时间')]]",
     "//table[.//img[@class=\"size\" or @alt=\"size\" or @title=\"size\"]]",
     "//table[.//td[contains(translate(normalize-space(string(.)), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'seeders')]]"
   ],
   "column_keywords": {
+    "type": ["类型"],
+    "title": ["标题"],
+    "publish_time": ["发布时间"],
     "size": ["size", "大小"],
-    "seeders": ["seeders", "种子", "在做种", "做种"],
-    "leechers": ["leechers", "下载"],
-    "publish_time": ["发布时间", "发表", "published", "time"],
-    "seed_time": ["做种时间", "seeding time"],
-    "weight": ["权重", "weight"],
-    "client": ["客户端", "client"]
+    "seeders": ["seeders", "种子数"],
+    "leechers": ["leechers", "下载数"],
+    "upload": ["上传"],
+    "download": ["下载"],
+    "ratio": ["分享率"],
+    "seed_time": ["做种时间"],
+    "client": ["客户端"],
+    "ip": ["IP"],
+    "action": ["操作"]
+  },
+  "column_parse_types": {
+    "size": "size",
+    "upload": "size",
+    "download": "size",
+    "seed_time": "duration",
+    "seeders": "int",
+    "leechers": "int",
+    "weight": "float",
+    "ratio": "raw",
+    "publish_time": "raw",
+    "client": "raw",
+    "type": "raw",
+    "title": "raw",
+    "ip": "raw",
+    "action": "raw"
   },
   "torrent_id_sources": [
-    {"xpath": ".//a[contains(@href,'details.php')]/@href", "regex": "(?:id|torrentid)=(\\d+)"},
-    {"xpath": ".//button[@data-torrent_id]/@data-torrent_id", "regex": "(\\d+)"}
+    {
+      "xpath": ".//a[contains(@href,'details.php')]/@href",
+      "regex": "(?:id|torrentid)=(\\d+)"
+    },
+    {
+      "xpath": ".//button[@data-torrent_id]/@data-torrent_id",
+      "regex": "(\\d+)"
+    }
   ],
   "name_xpath": ".//a[contains(@href,'details.php')]"
 }

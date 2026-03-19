@@ -2,8 +2,6 @@ from .init_service import init_plugin_db
 from .site_service import (
     get_sites_to_query,
     get_sites_from_plugindata,
-    write_site_infos_for_selected,
-    sync_site_seeding_data,
     trigger_sync_on_site_refresh,
 )
 from .downloader_seed_service import (
@@ -23,8 +21,6 @@ __all__ = [
     "init_plugin_db",
     "get_sites_to_query",
     "get_sites_from_plugindata",
-    "write_site_infos_for_selected",
-    "sync_site_seeding_data",
     "trigger_sync_on_site_refresh",
     "list_downloader_seeds_with_snapshot",
     "list_downloader_candidates_for_site",
